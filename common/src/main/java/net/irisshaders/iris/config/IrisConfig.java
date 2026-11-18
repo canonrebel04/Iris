@@ -5,6 +5,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.anr.NeuralSuperResolutionQuality;
 import net.irisshaders.iris.gui.option.IrisVideoSettings;
 import net.irisshaders.iris.pathways.colorspace.ColorSpace;
 import net.minecraft.resources.Identifier;
@@ -16,6 +17,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Properties;
 
@@ -51,6 +53,20 @@ public class IrisConfig {
 	 * If the update notification should be disabled or not.
 	 */
 	private boolean disableUpdateMessage;
+	/**
+	 * Master switch for the neural rendering integration layer. Off by default.
+	 * A native backend is loaded only when this is true and anrLibraryPath is set.
+	 */
+	private boolean anrEnabled;
+	private boolean anrFrameGeneration;
+	private boolean anrSuperResolution;
+	private NeuralSuperResolutionQuality anrSuperResolutionQuality;
+	private float anrSuperResolutionScale;
+	private boolean anrRayReconstruction;
+	/** Absolute or game-directory-relative path to a native library implementing the Iris ANR ABI. Empty means do not load one. */
+	private String anrLibraryPath;
+	/** colortex index a shader pack writes motion vectors into, or -1 if none is provided. */
+	private int anrMotionVectorColortex;
 
 	public IrisConfig(Path propertiesPath, Path excluded) {
 		shaderPackName = null;
@@ -58,6 +74,14 @@ public class IrisConfig {
 		allowUnknownShaders = false;
 		enableDebugOptions = false;
 		disableUpdateMessage = false;
+		anrEnabled = false;
+		anrFrameGeneration = false;
+		anrSuperResolution = false;
+		anrSuperResolutionQuality = NeuralSuperResolutionQuality.BALANCED;
+		anrSuperResolutionScale = 1.0f;
+		anrRayReconstruction = false;
+		anrLibraryPath = "";
+		anrMotionVectorColortex = -1;
 		this.propertiesPath = propertiesPath;
 		this.excludedPath = excluded;
 	}
@@ -171,6 +195,24 @@ public class IrisConfig {
 		allowUnknownShaders = "true".equals(properties.getProperty("allowUnknownShaders"));
 		enableDebugOptions = "true".equals(properties.getProperty("enableDebugOptions"));
 		disableUpdateMessage = "true".equals(properties.getProperty("disableUpdateMessage"));
+		anrEnabled = "true".equals(properties.getProperty("anrEnable"));
+		anrFrameGeneration = "true".equals(properties.getProperty("anrFrameGeneration"));
+		anrSuperResolution = "true".equals(properties.getProperty("anrSuperResolution"));
+		anrSuperResolutionQuality = NeuralSuperResolutionQuality.fromConfig(properties.getProperty("anrSuperResolutionQuality", "balanced"));
+		anrRayReconstruction = "true".equals(properties.getProperty("anrRayReconstruction"));
+		anrLibraryPath = properties.getProperty("anrLibraryPath", "");
+		try {
+			this.anrSuperResolutionScale = Float.parseFloat(properties.getProperty("anrSuperResolutionScale", "1.0"));
+		} catch (NumberFormatException e) {
+			Iris.logger.warn("anrSuperResolutionScale is invalid; using 1.0.");
+			this.anrSuperResolutionScale = 1.0f;
+		}
+		try {
+			this.anrMotionVectorColortex = Integer.parseInt(properties.getProperty("anrMotionVectorColortex", "-1"));
+		} catch (NumberFormatException e) {
+			Iris.logger.warn("anrMotionVectorColortex is invalid; using -1 (no pack motion vectors).");
+			this.anrMotionVectorColortex = -1;
+		}
 		try {
 			IrisVideoSettings.shadowDistance = Integer.parseInt(properties.getProperty("maxShadowRenderDistance", "32"));
 			IrisVideoSettings.colorSpace = ColorSpace.valueOf(properties.getProperty("colorSpace", "SRGB"));
@@ -200,6 +242,14 @@ public class IrisConfig {
 		properties.setProperty("allowUnknownShaders", Boolean.toString(allowUnknownShaders));
 		properties.setProperty("enableDebugOptions", Boolean.toString(enableDebugOptions));
 		properties.setProperty("disableUpdateMessage", Boolean.toString(disableUpdateMessage));
+		properties.setProperty("anrEnable", Boolean.toString(anrEnabled));
+		properties.setProperty("anrFrameGeneration", Boolean.toString(anrFrameGeneration));
+		properties.setProperty("anrSuperResolution", Boolean.toString(anrSuperResolution));
+		properties.setProperty("anrSuperResolutionQuality", anrSuperResolutionQuality.name().toLowerCase(Locale.ROOT));
+		properties.setProperty("anrSuperResolutionScale", Float.toString(anrSuperResolutionScale));
+		properties.setProperty("anrRayReconstruction", Boolean.toString(anrRayReconstruction));
+		properties.setProperty("anrLibraryPath", anrLibraryPath == null ? "" : anrLibraryPath);
+		properties.setProperty("anrMotionVectorColortex", Integer.toString(anrMotionVectorColortex));
 		properties.setProperty("maxShadowRenderDistance", String.valueOf(IrisVideoSettings.shadowDistance));
 		properties.setProperty("colorSpace", IrisVideoSettings.colorSpace.name());
 		// NB: This uses ISO-8859-1 with unicode escapes as the encoding
@@ -220,4 +270,37 @@ public class IrisConfig {
 		this.allowUnknownShaders = b;
 		save();
 	}
+
+	public boolean isAnrEnabled() {
+		return anrEnabled;
+	}
+
+	public boolean isAnrFrameGenerationEnabled() {
+		return anrFrameGeneration;
+	}
+
+	public boolean isAnrSuperResolutionEnabled() {
+		return anrSuperResolution;
+	}
+
+	public NeuralSuperResolutionQuality getAnrSuperResolutionQuality() {
+		return anrSuperResolutionQuality;
+	}
+
+	public float getAnrSuperResolutionScale() {
+		return anrSuperResolutionScale;
+	}
+
+	public boolean isAnrRayReconstructionEnabled() {
+		return anrRayReconstruction;
+	}
+
+	public String getAnrLibraryPath() {
+		return anrLibraryPath;
+	}
+
+	public int getAnrMotionVectorColortex() {
+		return anrMotionVectorColortex;
+	}
+
 }
