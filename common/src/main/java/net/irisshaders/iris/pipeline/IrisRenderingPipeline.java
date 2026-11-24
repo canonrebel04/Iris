@@ -14,6 +14,7 @@ import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.anr.NeuralRendering;
 import net.irisshaders.iris.anr.fsr.FsrFrameGeneration;
 import net.irisshaders.iris.anr.fsr.FsrMotionVectors;
+import net.irisshaders.iris.anr.fsr.FsrUpscaler;
 import net.irisshaders.iris.compat.dh.DHCompat;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.GLDebug;
@@ -127,6 +128,8 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	private final PackSamplers packSamplers;
 	@Nullable
 	private FsrMotionVectors fsrMotionVectors;
+	@Nullable
+	private FsrUpscaler fsrUpscaler;
 	@Nullable
 	private FsrFrameGeneration frameGeneration;
 	private final ShaderMap shaderMap;
@@ -338,6 +341,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			this.fsrMotionVectors = FsrMotionVectors.createIfNeeded(this.packSamplers, this.renderTargets);
 			if (this.fsrMotionVectors != null) {
 				cleanup.add(this.fsrMotionVectors::destroy);
+			}
+			this.fsrUpscaler = FsrUpscaler.createIfEnabled(this.packSamplers, this.fsrMotionVectors);
+			if (this.fsrUpscaler != null) {
+				cleanup.add(this.fsrUpscaler::destroy);
 			}
 			this.frameGeneration = FsrFrameGeneration.createIfEnabled(this.packSamplers, this.fsrMotionVectors);
 			if (this.frameGeneration != null) {
@@ -1130,6 +1137,12 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		}
 
 		NeuralRendering.afterFinalPass(this.renderTargets);
+
+		// Upscale into the full-resolution main target and swap it back in, before the hand overlay, screen
+		// effects, the color-space pass and the GUI. No-op unless this frame was rendered at a lower resolution.
+		if (this.fsrUpscaler != null) {
+			this.fsrUpscaler.upscaleAndRestore();
+		}
 	}
 
 	@Override
@@ -1290,6 +1303,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		if (this.frameGeneration != null) {
 			this.frameGeneration.destroy();
+		}
+
+		if (this.fsrUpscaler != null) {
+			this.fsrUpscaler.destroy();
 		}
 
 		if (this.fsrMotionVectors != null) {

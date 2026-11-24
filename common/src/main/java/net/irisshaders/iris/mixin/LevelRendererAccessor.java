@@ -1,5 +1,6 @@
 package net.irisshaders.iris.mixin;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.RenderBuffers;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
@@ -20,4 +21,7 @@ public interface LevelRendererAccessor {
 
 	@Accessor
 	LevelRenderState getLevelRenderState();
+
+	@Accessor("entityOutlineTarget")
+	RenderTarget getEntityOutlineTarget();
 }

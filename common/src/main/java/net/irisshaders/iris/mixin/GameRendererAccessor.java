@@ -1,10 +1,12 @@
 package net.irisshaders.iris.mixin;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.resource.CrossFrameResourcePool;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.gen.Accessor;
 import org.spongepowered.asm.mixin.gen.Invoker;
 
@@ -21,4 +23,9 @@ public interface GameRendererAccessor {
 
 	@Invoker
 	void invokeBobHurt(CameraRenderState state, PoseStack target);
+
+	/** Used by FSR upscaling to render the world into a lower-resolution main target for one frame. */
+	@Mutable
+	@Accessor("mainRenderTarget")
+	void iris$setMainRenderTarget(RenderTarget target);
 }

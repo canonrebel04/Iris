@@ -45,11 +45,13 @@ public final class FsrJitter {
 	}
 
 	/**
-	 * Converts a pixel jitter to the translation that has to be added to projection-matrix entries m20/m21
-	 * (column 2, rows 0 and 1 in JOML's column-major naming) so the whole frame shifts by that many pixels.
+	 * Converts a pixel jitter to an NDC translation, applied as {@code P' = translation(x, y, 0) * P}, so the whole
+	 * frame shifts by that many render pixels. Iris works in OpenGL conventions on both backends (UV and NDC both
+	 * have +Y up), so unlike the D3D-oriented FidelityFX samples there is no Y flip here; the upscaler shader uses
+	 * the same convention when it converts the jitter back.
 	 */
 	public static void toClipSpace(float[] pixelJitter, int renderWidth, int renderHeight, float[] out) {
 		out[0] = 2.0f * pixelJitter[0] / renderWidth;
-		out[1] = -2.0f * pixelJitter[1] / renderHeight;
+		out[1] = 2.0f * pixelJitter[1] / renderHeight;
 	}
 }

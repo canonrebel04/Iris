@@ -76,7 +76,7 @@ public class IrisConfig {
 	private boolean fsr3FrameGenPresent;
 	private FsrFramePacing fsr3FrameGenPacing;
 	private FsrDebugView fsr3FrameGenDebugView;
-	/** FSR 2/3-style temporal upscaling. Planned; currently only parsed and reported. Off by default. */
+	/** FSR 2/3-style temporal upscaling (needs a shader pack). Off by default. */
 	private boolean fsrUpscaling;
 	private FsrUpscalingQuality fsrUpscalingQuality;
 	private float fsrUpscalingSharpness;
