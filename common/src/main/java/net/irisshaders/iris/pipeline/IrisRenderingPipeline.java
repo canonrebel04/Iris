@@ -12,6 +12,7 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMaps;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.anr.NeuralRendering;
+import net.irisshaders.iris.anr.fsr.FsrFrameGeneration;
 import net.irisshaders.iris.compat.dh.DHCompat;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.GLDebug;
@@ -123,6 +124,8 @@ import java.util.function.Supplier;
 public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRenderingPipeline {
 	private final RenderTargets renderTargets;
 	private final PackSamplers packSamplers;
+	@Nullable
+	private FsrFrameGeneration frameGeneration;
 	private final ShaderMap shaderMap;
 	private int pipelineVersion = -1;
 	private final WorldRenderTargets worldTargets;
@@ -327,6 +330,11 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			this.centerDepthSampler = new CenterDepthSampler(this.packSamplers, this.renderTargets::getDepthTexture,
 				programSet.getPackDirectives().getCenterDepthHalfLife());
 			cleanup.add(this.centerDepthSampler::destroy);
+			// FSR 3-style frame generation. Null (and fully inert) unless fsr3FrameGen=true in iris.properties.
+			this.frameGeneration = FsrFrameGeneration.createIfEnabled(this.packSamplers, this.renderTargets);
+			if (this.frameGeneration != null) {
+				cleanup.add(this.frameGeneration::destroy);
+			}
 
 			this.shadowMapResolution = programSet.getPackDirectives().getShadowDirectives().getResolution();
 
@@ -1079,6 +1087,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		centerDepthSampler.sampleCenterDepth();
 
 		renderTargets.copyPreHandDepth();
+
+		if (this.frameGeneration != null) {
+			this.frameGeneration.onPreHandDepthCopied();
+		}
 	}
 
 	@Override
@@ -1104,12 +1116,21 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		this.compositeRenderer.renderAll();
 		this.finalPassRenderer.renderFinalPass();
+
+		if (this.frameGeneration != null) {
+			this.frameGeneration.afterFinalPass();
+		}
+
 		NeuralRendering.afterFinalPass(this.renderTargets);
 	}
 
 	@Override
 	public void finalizeGameRendering() {
 		this.colorSpaceConverter.process(Minecraft.getInstance().gameRenderer.mainRenderTarget().getColorTextureView());
+
+		if (this.frameGeneration != null) {
+			this.frameGeneration.captureHudless(Minecraft.getInstance().gameRenderer.mainRenderTarget().getColorTexture());
+		}
 	}
 
 	@Override
@@ -1258,6 +1279,11 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		deferredRenderer.destroy();
 		finalPassRenderer.destroy();
 		centerDepthSampler.destroy();
+
+		if (this.frameGeneration != null) {
+			this.frameGeneration.destroy();
+		}
+
 		customTextureManager.destroy();
 		whitePixel.close();
 		biggerWhitePixel.close();

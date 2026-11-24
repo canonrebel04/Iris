@@ -2,6 +2,7 @@ package net.irisshaders.iris.anr;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.anr.fsr.FsrFrameGeneration;
 import net.irisshaders.iris.config.IrisConfig;
 import net.irisshaders.iris.targets.RenderTargets;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
@@ -154,7 +155,10 @@ public final class NeuralRendering {
 	private static NeuralTextureHandle motionVectorHandle(IrisConfig config, RenderTargets renderTargets) {
 		int index = config.getAnrMotionVectorColortex();
 		if (index < 0) {
-			return NeuralTextureHandle.empty();
+			// No pack motion vectors configured: fall back to Iris's camera-reprojection pass when FSR 3 frame
+			// generation produced one this frame (RGBA16F, rg = prevUv - uv).
+			var generated = FsrFrameGeneration.currentMotionVectors();
+			return generated == null ? NeuralTextureHandle.empty() : NeuralTextureHandle.from(generated);
 		}
 
 		if (renderTargets == null || index >= renderTargets.getRenderTargetCount()) {
@@ -176,7 +180,7 @@ public final class NeuralRendering {
 			loggedMissingMotionVectors = true;
 			Iris.logger.warn(
 				"[ANR] anrMotionVectorColortex is set to {}, but that colortex is not available this frame. " +
-					"Motion vectors will be omitted. A camera-only motion vector pass is not implemented; see docs/ANR.md.",
+					"Motion vectors will be omitted. Set it to -1 to use Iris's camera motion vectors (needs fsr3FrameGen=true); see docs/ANR.md.",
 				index);
 		}
 	}
