@@ -6,6 +6,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.anr.NeuralSuperResolutionQuality;
+import net.irisshaders.iris.anr.fsr.FsrDebugView;
+import net.irisshaders.iris.anr.fsr.FsrFramePacing;
+import net.irisshaders.iris.anr.fsr.FsrUpscalingQuality;
 import net.irisshaders.iris.gui.option.IrisVideoSettings;
 import net.irisshaders.iris.pathways.colorspace.ColorSpace;
 import net.minecraft.resources.Identifier;
@@ -67,6 +70,16 @@ public class IrisConfig {
 	private String anrLibraryPath;
 	/** colortex index a shader pack writes motion vectors into, or -1 if none is provided. */
 	private int anrMotionVectorColortex;
+	/** FSR 3-based frame generation implemented inside Iris (shader port, no native code). Off by default. */
+	private boolean fsr3FrameGen;
+	/** Present generated frames. When false the passes still run (for debugging) but nothing extra is shown. */
+	private boolean fsr3FrameGenPresent;
+	private FsrFramePacing fsr3FrameGenPacing;
+	private FsrDebugView fsr3FrameGenDebugView;
+	/** FSR 2/3-style temporal upscaling. Planned; currently only parsed and reported. Off by default. */
+	private boolean fsrUpscaling;
+	private FsrUpscalingQuality fsrUpscalingQuality;
+	private float fsrUpscalingSharpness;
 
 	public IrisConfig(Path propertiesPath, Path excluded) {
 		shaderPackName = null;
@@ -82,6 +95,13 @@ public class IrisConfig {
 		anrRayReconstruction = false;
 		anrLibraryPath = "";
 		anrMotionVectorColortex = -1;
+		fsr3FrameGen = false;
+		fsr3FrameGenPresent = true;
+		fsr3FrameGenPacing = FsrFramePacing.VSYNC;
+		fsr3FrameGenDebugView = FsrDebugView.NONE;
+		fsrUpscaling = false;
+		fsrUpscalingQuality = FsrUpscalingQuality.QUALITY;
+		fsrUpscalingSharpness = 0.2f;
 		this.propertiesPath = propertiesPath;
 		this.excludedPath = excluded;
 	}
@@ -213,6 +233,18 @@ public class IrisConfig {
 			Iris.logger.warn("anrMotionVectorColortex is invalid; using -1 (no pack motion vectors).");
 			this.anrMotionVectorColortex = -1;
 		}
+		fsr3FrameGen = "true".equals(properties.getProperty("fsr3FrameGen"));
+		fsr3FrameGenPresent = !"false".equals(properties.getProperty("fsr3FrameGenPresent"));
+		fsr3FrameGenPacing = FsrFramePacing.fromConfig(properties.getProperty("fsr3FrameGenPacing", "vsync"));
+		fsr3FrameGenDebugView = FsrDebugView.fromConfig(properties.getProperty("fsr3FrameGenDebugView", "none"));
+		fsrUpscaling = "true".equals(properties.getProperty("fsrUpscaling"));
+		fsrUpscalingQuality = FsrUpscalingQuality.fromConfig(properties.getProperty("fsrUpscalingQuality", "quality"));
+		try {
+			this.fsrUpscalingSharpness = Math.clamp(Float.parseFloat(properties.getProperty("fsrUpscalingSharpness", "0.2")), 0.0f, 1.0f);
+		} catch (NumberFormatException e) {
+			Iris.logger.warn("fsrUpscalingSharpness is invalid; using 0.2.");
+			this.fsrUpscalingSharpness = 0.2f;
+		}
 		try {
 			IrisVideoSettings.shadowDistance = Integer.parseInt(properties.getProperty("maxShadowRenderDistance", "32"));
 			IrisVideoSettings.colorSpace = ColorSpace.valueOf(properties.getProperty("colorSpace", "SRGB"));
@@ -250,6 +282,13 @@ public class IrisConfig {
 		properties.setProperty("anrRayReconstruction", Boolean.toString(anrRayReconstruction));
 		properties.setProperty("anrLibraryPath", anrLibraryPath == null ? "" : anrLibraryPath);
 		properties.setProperty("anrMotionVectorColortex", Integer.toString(anrMotionVectorColortex));
+		properties.setProperty("fsr3FrameGen", Boolean.toString(fsr3FrameGen));
+		properties.setProperty("fsr3FrameGenPresent", Boolean.toString(fsr3FrameGenPresent));
+		properties.setProperty("fsr3FrameGenPacing", fsr3FrameGenPacing.configName());
+		properties.setProperty("fsr3FrameGenDebugView", fsr3FrameGenDebugView.configName());
+		properties.setProperty("fsrUpscaling", Boolean.toString(fsrUpscaling));
+		properties.setProperty("fsrUpscalingQuality", fsrUpscalingQuality.configName());
+		properties.setProperty("fsrUpscalingSharpness", Float.toString(fsrUpscalingSharpness));
 		properties.setProperty("maxShadowRenderDistance", String.valueOf(IrisVideoSettings.shadowDistance));
 		properties.setProperty("colorSpace", IrisVideoSettings.colorSpace.name());
 		// NB: This uses ISO-8859-1 with unicode escapes as the encoding
@@ -303,4 +342,31 @@ public class IrisConfig {
 		return anrMotionVectorColortex;
 	}
 
+	public boolean isFsr3FrameGenEnabled() {
+		return fsr3FrameGen;
+	}
+
+	public boolean shouldPresentFsr3GeneratedFrames() {
+		return fsr3FrameGenPresent;
+	}
+
+	public FsrFramePacing getFsr3FrameGenPacing() {
+		return fsr3FrameGenPacing;
+	}
+
+	public FsrDebugView getFsr3FrameGenDebugView() {
+		return fsr3FrameGenDebugView;
+	}
+
+	public boolean isFsrUpscalingEnabled() {
+		return fsrUpscaling;
+	}
+
+	public FsrUpscalingQuality getFsrUpscalingQuality() {
+		return fsrUpscalingQuality;
+	}
+
+	public float getFsrUpscalingSharpness() {
+		return fsrUpscalingSharpness;
+	}
 }
