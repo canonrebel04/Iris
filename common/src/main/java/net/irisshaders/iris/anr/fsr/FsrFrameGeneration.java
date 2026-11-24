@@ -14,25 +14,13 @@ import net.irisshaders.iris.pipeline.programs.CompositeProgram;
 import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.samplers.PackSamplers;
 import net.irisshaders.iris.targets.ColorAttachmentPlan;
-import net.irisshaders.iris.targets.RenderTargets;
-import net.irisshaders.iris.uniforms.CameraUniforms;
-import net.irisshaders.iris.uniforms.CapturedRenderingState;
 import net.minecraft.client.Minecraft;
 import org.jetbrains.annotations.Nullable;
-import org.joml.Matrix4d;
-import org.joml.Matrix4f;
-import org.joml.Matrix4fc;
-import org.joml.Vector3d;
 import org.joml.Vector4f;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -41,10 +29,10 @@ import java.util.Set;
  *
  * <p>Per real frame N:</p>
  * <ol>
- *     <li>{@link #afterFinalPass()} (after the shader pack's final pass, depth still valid): camera-reprojection
- *     motion vectors + depth disocclusion into {@link #motionTexture}, then keep a copy of depth for frame N+1.</li>
- *     <li>{@link #captureHudless(GpuTexture)} (after Iris's color-space pass, before the GUI is drawn): copy the
- *     HUD-less scene color.</li>
+ *     <li>{@link FsrMotionVectors#render()} (after the shader pack's final pass): camera-reprojection motion vectors
+ *     + depth disocclusion, at render resolution (lower than the display when {@link FsrUpscaler} is on).</li>
+ *     <li>{@link #captureHudless(GpuTexture)} (after Iris's color-space pass, before the GUI is drawn, always at
+ *     display resolution): copy the HUD-less scene color.</li>
  *     <li>{@link #beforeSwapchainBlit} (from Minecraft's frame loop, after the GUI): interpolate a frame halfway
  *     between N-1 and N, present it, re-acquire the swapchain, and let vanilla present the real frame N.</li>
  * </ol>
@@ -54,33 +42,16 @@ import java.util.Set;
  */
 public final class FsrFrameGeneration {
 	private static final String LOG_PREFIX = "[FSR3-FG] ";
-	private static final int COLOR_USAGE = GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_COPY_SRC | GpuTexture.USAGE_TEXTURE_BINDING
-		| GpuTexture.USAGE_RENDER_ATTACHMENT;
-	/** Camera moves larger than this (blocks) between frames are treated as a cut, and history is reset. */
-	private static final double CAMERA_CUT_DISTANCE = 32.0;
 
 	@Nullable
 	private static FsrFrameGeneration active;
-	/** Counts calls to {@link #beforeSwapchainBlit}, i.e. real frames. */
-	private static long frameIndex;
 
-	private final RenderTargets renderTargets;
-	private final CompositeProgram motionProgram;
+	private final FsrMotionVectors motion;
 	private final CompositeProgram interpolateProgram;
 	private final FsrFramePacing pacing;
 	private final FsrDebugView debugView;
 	private final boolean present;
 
-	// Current-frame inputs for the draw bindings. Draw bindings are resolved on every draw.
-	private GpuTextureView depthView;
-	private GpuTextureView noHandDepthView;
-	private GpuTexture depthViewSource;
-	private GpuTexture noHandViewSource;
-
-	private GpuTexture motionTexture;
-	private GpuTextureView motionView;
-	private GpuTexture previousDepth;
-	private GpuTextureView previousDepthView;
 	private final GpuTexture[] hudless = new GpuTexture[2];
 	private final GpuTextureView[] hudlessViews = new GpuTextureView[2];
 	private int currentHudless;
@@ -91,19 +62,9 @@ public final class FsrFrameGeneration {
 	private int width = -1;
 	private int height = -1;
 	private GpuFormat colorFormat;
-	private GpuFormat depthFormat;
 
-	private final Matrix4f reprojection = new Matrix4f();
-	private final Vector4f motionParams = new Vector4f();
 	private final Vector4f interpolateSettings = new Vector4f();
-	private final Matrix4f previousView = new Matrix4f();
-	private final Matrix4f previousProjection = new Matrix4f();
-	private final Vector3d previousCamera = new Vector3d();
-	private boolean hasPreviousCamera;
-	private boolean hasPreviousDepth;
-	private boolean handDepthValid;
 
-	private long motionFrame = -1;
 	private long hudlessFrame = -1;
 	private long previousHudlessFrame = -2;
 	private long historyResetFrame = -1;
@@ -113,46 +74,24 @@ public final class FsrFrameGeneration {
 	private double smoothedWorkSeconds = -1;
 	private long lastRealPresentNanos;
 	private boolean loggedFirstFrame;
-	private boolean loggedMissingHook;
-	private int finalPassesWithoutPresentHook;
 	private boolean loggedFailure;
 	private boolean failed;
 	private boolean destroyed;
 
-	private FsrFrameGeneration(PackSamplers samplers, RenderTargets renderTargets, IrisConfig config) {
-		this.renderTargets = renderTargets;
+	private FsrFrameGeneration(PackSamplers samplers, FsrMotionVectors motion, IrisConfig config) {
+		this.motion = motion;
 		this.pacing = config.getFsr3FrameGenPacing();
 		this.debugView = config.getFsr3FrameGenDebugView();
 		this.present = config.shouldPresentFsr3GeneratedFrames();
 
-		var cleanup = new ArrayList<Runnable>();
+		String vertex = FsrShaders.read("/fsr3fg/fullscreen.vsh");
+		var interpolateOutputs = new ColorAttachmentPlan.Builder().program("fsr3fg_interpolate", new int[]{0}, Set.of()).build(1)
+			.program("fsr3fg_interpolate");
+		this.interpolateProgram = new CompositeProgram(samplers, "fsr3fg_interpolate",
+			Map.of(PatchShaderType.VERTEX, vertex, PatchShaderType.FRAGMENT, FsrShaders.read("/fsr3fg/interpolate.fsh")),
+			interpolateOutputs, Collections.singletonList(null));
 
 		try {
-			String vertex = readShader("/fsr3fg/fullscreen.vsh");
-
-			var motionOutputs = new ColorAttachmentPlan.Builder().program("fsr3fg_motion", new int[]{0}, Set.of()).build(1)
-				.program("fsr3fg_motion");
-			this.motionProgram = new CompositeProgram(samplers, "fsr3fg_motion",
-				Map.of(PatchShaderType.VERTEX, vertex, PatchShaderType.FRAGMENT, readShader("/fsr3fg/motion.fsh")), motionOutputs,
-				Collections.singletonList(null));
-			cleanup.add(this.motionProgram::destroy);
-			this.motionProgram.getUniforms().uniformMatrix(UniformUpdateFrequency.CUSTOM, "fgReproject", () -> this.reprojection);
-			this.motionProgram.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgParams", () -> this.motionParams);
-			var motionSamplers = this.motionProgram.getSamplers();
-			motionSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/depth", () -> this.depthView, () -> GlSampler.NEAREST), false,
-				"fgDepth");
-			motionSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/depthNoHand", () -> this.noHandDepthView, () -> GlSampler.NEAREST),
-				false, "fgDepthNoHand");
-			motionSamplers.addDrawTextureSampler(
-				new TextureBinding("fsr3fg/previousDepth", () -> this.previousDepthView, () -> GlSampler.NEAREST), false, "fgPrevDepth");
-			motionSamplers.finish();
-
-			var interpolateOutputs = new ColorAttachmentPlan.Builder().program("fsr3fg_interpolate", new int[]{0}, Set.of()).build(1)
-				.program("fsr3fg_interpolate");
-			this.interpolateProgram = new CompositeProgram(samplers, "fsr3fg_interpolate",
-				Map.of(PatchShaderType.VERTEX, vertex, PatchShaderType.FRAGMENT, readShader("/fsr3fg/interpolate.fsh")),
-				interpolateOutputs, Collections.singletonList(null));
-			cleanup.add(this.interpolateProgram::destroy);
 			this.interpolateProgram.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgSettings", () -> this.interpolateSettings);
 			var interpolateSamplers = this.interpolateProgram.getSamplers();
 			interpolateSamplers.addDrawTextureSampler(
@@ -161,21 +100,15 @@ public final class FsrFrameGeneration {
 			interpolateSamplers.addDrawTextureSampler(
 				new TextureBinding("fsr3fg/currentColor", () -> this.hudlessViews[this.currentHudless], () -> GlSampler.NEAREST), false,
 				"fgCurrColor");
-			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/motion", () -> this.motionView, () -> GlSampler.NEAREST),
+			// Motion is at render resolution and may be smaller than the display; the shader samples it with normalized UVs.
+			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/motion", this.motion::view, () -> GlSampler.NEAREST),
 				false, "fgMotion");
 			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/finalColor", () -> this.finalCopyView, () -> GlSampler.NEAREST),
 				false, "fgFinalColor");
 			interpolateSamplers.finish();
-		} catch (RuntimeException | Error failure) {
-			for (var close : cleanup.reversed()) {
-				try {
-					close.run();
-				} catch (RuntimeException | Error e) {
-					failure.addSuppressed(e);
-				}
-			}
-
-			throw failure;
+		} catch (RuntimeException | Error e) {
+			this.interpolateProgram.destroy();
+			throw e;
 		}
 	}
 
@@ -186,21 +119,20 @@ public final class FsrFrameGeneration {
 	 * @return null when disabled or when setup failed (Iris then renders exactly as without frame generation)
 	 */
 	@Nullable
-	public static FsrFrameGeneration createIfEnabled(PackSamplers samplers, RenderTargets renderTargets) {
+	public static FsrFrameGeneration createIfEnabled(PackSamplers samplers, @Nullable FsrMotionVectors motion) {
 		IrisConfig config = Iris.getIrisConfig();
 
-		if (config == null) {
+		if (config == null || !config.isFsr3FrameGenEnabled()) {
 			return null;
 		}
 
-		FsrUpscaling.logStatus(config);
-
-		if (!config.isFsr3FrameGenEnabled()) {
+		if (motion == null) {
+			Iris.logger.error(LOG_PREFIX + "No motion vectors are available; frame generation is disabled for this shader pack.");
 			return null;
 		}
 
 		try {
-			var generator = new FsrFrameGeneration(samplers, renderTargets, config);
+			var generator = new FsrFrameGeneration(samplers, motion, config);
 			active = generator;
 			Iris.logger.info(LOG_PREFIX + "Enabled on the {} backend (present={}, pacing={}, debugView={}).",
 				RenderSystem.getDevice().getDeviceInfo().backendName(), generator.present, generator.pacing.configName(),
@@ -218,104 +150,40 @@ public final class FsrFrameGeneration {
 		return active;
 	}
 
-	/**
-	 * Camera-reprojection motion vectors for the current frame (RGBA16F: rg = prevUv - uv, b = disocclusion,
-	 * a = hand), or null if none were produced this frame. Used by the ANR layer when the pack has none.
-	 */
-	@Nullable
-	public static GpuTextureView currentMotionVectors() {
-		var generator = active;
-
-		if (generator == null || generator.failed || generator.motionFrame != frameIndex) {
-			return null;
-		}
-
-		return generator.motionView;
-	}
-
-	/** Called from {@code IrisRenderingPipeline.beginHand()} right after the pre-hand depth copy. */
-	public void onPreHandDepthCopied() {
-		this.handDepthValid = true;
-	}
-
-	/** Step 1: after the shader pack's final pass. */
-	public void afterFinalPass() {
-		if (this.failed || this.destroyed) {
-			return;
-		}
-
-		if (frameIndex == 0 && ++this.finalPassesWithoutPresentHook > 30 && !this.loggedMissingHook) {
-			this.loggedMissingHook = true;
-			Iris.logger.warn(LOG_PREFIX + "The swapchain present hook (MixinMinecraft_FrameGeneration) never ran; generated frames "
-				+ "cannot be shown on this Minecraft version.");
-		}
-
-		try {
-			var main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
-			var mainColor = main.getColorTexture();
-			var depth = this.renderTargets.getDepthTexture();
-			var noHand = this.renderTargets.getDepthTextureNoHand();
-			Matrix4fc view = CapturedRenderingState.INSTANCE.getGbufferModelView();
-			Matrix4fc projection = CapturedRenderingState.INSTANCE.getGbufferProjection();
-
-			if (mainColor == null || depth == null || view == null || projection == null) {
-				return;
-			}
-
-			this.ensureResources(mainColor, depth);
-			this.updateDepthViews(depth, noHand);
-
-			Vector3d camera = CameraUniforms.getUnshiftedCameraPosition();
-
-			if (this.hasPreviousCamera && camera.distance(this.previousCamera) > CAMERA_CUT_DISTANCE) {
-				this.resetHistory("camera cut");
-			}
-
-			this.buildReprojection(view, projection, camera);
-			this.motionParams.set(this.previousProjection.m22(), this.previousProjection.m32(), this.hasPreviousDepth ? 1.0f : 0.0f,
-				this.handDepthValid && noHand != null ? 1.0f : 0.0f);
-			this.motionProgram.draw(List.of(this.motionView), ViewportData.defaultValue(), 0, ++this.drawCounter);
-
-			RenderSystem.getDevice().createCommandEncoder()
-				.copyTextureToTexture(depth, this.previousDepth, 0, 0, 0, 0, 0, this.width, this.height);
-			this.hasPreviousDepth = true;
-
-			this.previousView.set(view);
-			this.previousProjection.set(projection);
-			this.previousCamera.set(camera);
-			this.hasPreviousCamera = true;
-			this.motionFrame = frameIndex;
-		} catch (RuntimeException e) {
-			this.fail("motion vector pass", e);
-		} finally {
-			this.handDepthValid = false;
-		}
-	}
-
-	/** Step 2: after the color-space pass, before the GUI. {@code mainColor} holds the HUD-less frame. */
+	/** After the color-space pass, before the GUI. {@code mainColor} holds the HUD-less, display-resolution frame. */
 	public void captureHudless(GpuTexture mainColor) {
-		if (this.failed || this.destroyed || this.motionFrame != frameIndex || mainColor == null) {
+		if (this.destroyed) {
+			return;
+		}
+
+		// Iris keeps one pipeline per dimension alive; the one rendering this frame presents the generated frame.
+		active = this;
+
+		if (this.failed || !this.motion.isValidThisFrame() || mainColor == null) {
 			return;
 		}
 
 		try {
-			if (mainColor.getWidth(0) != this.width || mainColor.getHeight(0) != this.height || mainColor.getFormat() != this.colorFormat) {
-				return;
+			this.ensureResources(mainColor);
+
+			if (this.motion.historyResetThisFrame()) {
+				this.resetHistory("motion history reset");
 			}
 
+			long frame = FsrFrameState.frameIndex();
 			this.currentHudless = 1 - this.currentHudless;
 			RenderSystem.getDevice().createCommandEncoder()
 				.copyTextureToTexture(mainColor, this.hudless[this.currentHudless], 0, 0, 0, 0, 0, this.width, this.height);
 			// After a reset (resize, camera cut) the other HUD-less buffer must not be interpolated against.
-			this.previousHudlessFrame = this.historyResetFrame == frameIndex ? -2 : this.hudlessFrame;
-			this.hudlessFrame = frameIndex;
+			this.previousHudlessFrame = this.historyResetFrame == frame ? -2 : this.hudlessFrame;
+			this.hudlessFrame = frame;
 		} catch (RuntimeException e) {
 			this.fail("HUD-less capture", e);
 		}
 	}
 
 	/**
-	 * Step 3, called from Minecraft's frame loop right before the real frame is copied to the swapchain.
+	 * Called from Minecraft's frame loop right before the real frame is copied to the swapchain.
 	 * Always advances the frame counter, even when frame generation is off.
 	 */
 	public static void beforeSwapchainBlit(com.mojang.renderpearl.api.device.GpuSurface surface) {
@@ -326,12 +194,13 @@ public final class FsrFrameGeneration {
 				generator.generateAndPresent(surface);
 			}
 		} finally {
-			frameIndex++;
+			FsrFrameState.advanceFrame();
 		}
 	}
 
 	private void generateAndPresent(com.mojang.renderpearl.api.device.GpuSurface surface) {
-		boolean haveFrame = this.hudlessFrame == frameIndex && this.motionFrame == frameIndex;
+		long frame = FsrFrameState.frameIndex();
+		boolean haveFrame = this.hudlessFrame == frame && this.motion.isValidThisFrame();
 
 		if (!haveFrame) {
 			// The world was not rendered this frame (menus, loading): next interpolation must not span the gap.
@@ -342,7 +211,7 @@ public final class FsrFrameGeneration {
 			return;
 		}
 
-		boolean consecutive = this.previousHudlessFrame == frameIndex - 1;
+		boolean consecutive = this.previousHudlessFrame == frame - 1;
 		this.interpolateSettings.set(this.debugView.shaderId(), consecutive ? this.framesSinceReset : 0, 0, 0);
 		this.framesSinceReset = consecutive ? this.framesSinceReset + 1 : 0;
 
@@ -351,10 +220,10 @@ public final class FsrFrameGeneration {
 		}
 
 		try {
-			var main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
-			var mainColor = main.getColorTexture();
+			var mainColor = Minecraft.getInstance().gameRenderer.mainRenderTarget().getColorTexture();
 
-			if (mainColor == null || mainColor.getWidth(0) != this.width || mainColor.getHeight(0) != this.height) {
+			if (mainColor == null || mainColor.getWidth(0) != this.width || mainColor.getHeight(0) != this.height
+				|| mainColor.getFormat() != this.colorFormat) {
 				return;
 			}
 
@@ -427,26 +296,11 @@ public final class FsrFrameGeneration {
 		this.lastRealPresentNanos = System.nanoTime();
 	}
 
-	private void buildReprojection(Matrix4fc view, Matrix4fc projection, Vector3d camera) {
-		if (!this.hasPreviousCamera) {
-			this.previousView.set(view);
-			this.previousProjection.set(projection);
-			this.previousCamera.set(camera);
-		}
-
-		// current NDC -> current view -> eye/player space -> world-relative to the previous camera -> previous clip.
-		Matrix4d currentInverse = new Matrix4d(projection).mul(new Matrix4d(view)).invert();
-		Matrix4d previous = new Matrix4d(this.previousProjection).mul(new Matrix4d(this.previousView))
-			.translate(camera.x - this.previousCamera.x, camera.y - this.previousCamera.y, camera.z - this.previousCamera.z);
-		this.reprojection.set(previous.mul(currentInverse));
-	}
-
-	private void ensureResources(GpuTexture mainColor, GpuTexture depth) {
+	private void ensureResources(GpuTexture mainColor) {
 		int w = mainColor.getWidth(0);
 		int h = mainColor.getHeight(0);
 
-		if (w == this.width && h == this.height && mainColor.getFormat() == this.colorFormat && depth.getFormat() == this.depthFormat
-			&& this.motionTexture != null) {
+		if (w == this.width && h == this.height && mainColor.getFormat() == this.colorFormat && this.output != null) {
 			return;
 		}
 
@@ -455,59 +309,25 @@ public final class FsrFrameGeneration {
 		this.width = w;
 		this.height = h;
 		this.colorFormat = mainColor.getFormat();
-		this.depthFormat = depth.getFormat();
-
-		this.motionTexture = device.createTexture("Iris FSR3 FG motion", COLOR_USAGE, GpuFormat.RGBA16_FLOAT, w, h, 1, 1);
-		this.motionView = device.createTextureView(this.motionTexture);
-		this.previousDepth = device.createTexture("Iris FSR3 FG previous depth", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
-			this.depthFormat, w, h, 1, 1);
-		this.previousDepthView = device.createTextureView(this.previousDepth, 0, 1);
 
 		for (int i = 0; i < 2; i++) {
-			this.hudless[i] = device.createTexture("Iris FSR3 FG HUD-less " + i, COLOR_USAGE, this.colorFormat, w, h, 1, 1);
+			this.hudless[i] = device.createTexture("Iris FSR3 FG HUD-less " + i, FsrMotionVectors.COLOR_USAGE, this.colorFormat, w, h, 1, 1);
 			this.hudlessViews[i] = device.createTextureView(this.hudless[i]);
 		}
 
-		this.finalCopy = device.createTexture("Iris FSR3 FG presented copy", COLOR_USAGE, this.colorFormat, w, h, 1, 1);
+		this.finalCopy = device.createTexture("Iris FSR3 FG presented copy", FsrMotionVectors.COLOR_USAGE, this.colorFormat, w, h, 1, 1);
 		this.finalCopyView = device.createTextureView(this.finalCopy);
-		this.output = device.createTexture("Iris FSR3 FG output", COLOR_USAGE, this.colorFormat, w, h, 1, 1);
+		this.output = device.createTexture("Iris FSR3 FG output", FsrMotionVectors.COLOR_USAGE, this.colorFormat, w, h, 1, 1);
 		this.outputView = device.createTextureView(this.output);
 
 		this.resetHistory("resize");
-		Iris.logger.info(LOG_PREFIX + "Allocated {}x{} frame generation targets (color {}, depth {}).", w, h, this.colorFormat,
-			this.depthFormat);
-	}
-
-	private void updateDepthViews(GpuTexture depth, @Nullable GpuTexture noHand) {
-		var device = RenderSystem.getDevice();
-
-		if (this.depthViewSource != depth) {
-			if (this.depthView != null) {
-				this.depthView.close();
-			}
-
-			this.depthView = device.createTextureView(depth, 0, 1);
-			this.depthViewSource = depth;
-		}
-
-		GpuTexture handSource = noHand != null ? noHand : depth;
-
-		if (this.noHandViewSource != handSource) {
-			if (this.noHandDepthView != null) {
-				this.noHandDepthView.close();
-			}
-
-			this.noHandDepthView = device.createTextureView(handSource, 0, 1);
-			this.noHandViewSource = handSource;
-		}
+		Iris.logger.info(LOG_PREFIX + "Allocated {}x{} frame generation targets (color {}).", w, h, this.colorFormat);
 	}
 
 	private void resetHistory(String reason) {
-		this.hasPreviousDepth = false;
-		this.hasPreviousCamera = false;
 		this.previousHudlessFrame = -2;
 		this.framesSinceReset = 0;
-		this.historyResetFrame = frameIndex;
+		this.historyResetFrame = FsrFrameState.frameIndex();
 		Iris.logger.debug(LOG_PREFIX + "History reset (" + reason + ").");
 	}
 
@@ -521,23 +341,21 @@ public final class FsrFrameGeneration {
 	}
 
 	private void closeTextures() {
-		for (var view : new GpuTextureView[]{this.motionView, this.previousDepthView, this.hudlessViews[0], this.hudlessViews[1],
-			this.finalCopyView, this.outputView}) {
+		for (var view : new GpuTextureView[]{this.hudlessViews[0], this.hudlessViews[1], this.finalCopyView, this.outputView}) {
 			if (view != null) {
 				view.close();
 			}
 		}
 
-		for (var texture : new GpuTexture[]{this.motionTexture, this.previousDepth, this.hudless[0], this.hudless[1], this.finalCopy,
-			this.output}) {
+		for (var texture : new GpuTexture[]{this.hudless[0], this.hudless[1], this.finalCopy, this.output}) {
 			if (texture != null) {
 				texture.close();
 			}
 		}
 
-		this.motionView = this.previousDepthView = this.finalCopyView = this.outputView = null;
+		this.finalCopyView = this.outputView = null;
 		this.hudlessViews[0] = this.hudlessViews[1] = null;
-		this.motionTexture = this.previousDepth = this.finalCopy = this.output = null;
+		this.finalCopy = this.output = null;
 		this.hudless[0] = this.hudless[1] = null;
 	}
 
@@ -552,24 +370,7 @@ public final class FsrFrameGeneration {
 			active = null;
 		}
 
-		this.motionProgram.destroy();
 		this.interpolateProgram.destroy();
 		this.closeTextures();
-
-		if (this.depthView != null) {
-			this.depthView.close();
-		}
-
-		if (this.noHandDepthView != null) {
-			this.noHandDepthView.close();
-		}
-	}
-
-	private static String readShader(String resource) {
-		try (var stream = Objects.requireNonNull(FsrFrameGeneration.class.getResourceAsStream(resource), resource)) {
-			return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
 	}
 }

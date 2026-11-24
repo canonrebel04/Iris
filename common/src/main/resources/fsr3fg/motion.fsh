@@ -8,7 +8,8 @@
 //
 // Output (RGBA16F):
 //   rg = motion vector in UV space, pointing from this frame to the previous one (prevUv - uv),
-//        the same convention as FidelityFX FSR 2/3 game motion vectors
+//        the same convention as FidelityFX FSR 2/3 game motion vectors. Camera jitter (FSR upscaling) is
+//        removed from both ends, as FSR 2/3 require.
 //   b  = 1 if this surface was not visible in the previous frame (depth disocclusion), else 0
 //   a  = 1 for first-person hand pixels (they move with the camera, so their motion is forced to 0)
 
@@ -17,6 +18,7 @@ uniform sampler2D fgDepthNoHand; // raw depth copied just before the hand was dr
 uniform sampler2D fgPrevDepth;   // raw depth of the previous frame
 uniform mat4 fgReproject;        // this frame's NDC (OpenGL -1..1 Z, Iris gbufferProjection convention) -> previous clip
 uniform vec4 fgParams;           // x = prev proj m22, y = prev proj m32, z = has history (0/1), w = hand depth valid (0/1)
+uniform vec4 fgJitter;           // xy = this frame's jitter in UV units, zw = previous frame's (0 without upscaling)
 
 in vec2 uv;
 out vec4 outMotion;
@@ -54,8 +56,10 @@ void main() {
     }
 
     vec3 previousNdc = previousClip.xyz / previousClip.w;
+    // fgReproject maps into the previous frame's un-jittered clip space, and the un-jittered position of this
+    // pixel's sample is uv - jitter.
     vec2 previousUv = previousNdc.xy * 0.5 + 0.5;
-    vec2 motion = previousUv - uv;
+    vec2 motion = previousUv - (uv - fgJitter.xy);
 
     float disoccluded = 0.0;
 
@@ -63,7 +67,7 @@ void main() {
         if (!insideUv(previousUv)) {
             disoccluded = 1.0;
         } else {
-            float previousRaw = texture(fgPrevDepth, previousUv).r;
+            float previousRaw = texture(fgPrevDepth, previousUv + fgJitter.zw).r;
             float expected = linearDistance(previousNdc.z);
             float actual = linearDistance((1.0 - previousRaw) * 2.0 - 1.0);
 

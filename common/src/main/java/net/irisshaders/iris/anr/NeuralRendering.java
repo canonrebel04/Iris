@@ -2,7 +2,7 @@ package net.irisshaders.iris.anr;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import net.irisshaders.iris.Iris;
-import net.irisshaders.iris.anr.fsr.FsrFrameGeneration;
+import net.irisshaders.iris.anr.fsr.FsrMotionVectors;
 import net.irisshaders.iris.config.IrisConfig;
 import net.irisshaders.iris.targets.RenderTargets;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
@@ -156,8 +156,8 @@ public final class NeuralRendering {
 		int index = config.getAnrMotionVectorColortex();
 		if (index < 0) {
 			// No pack motion vectors configured: fall back to Iris's camera-reprojection pass when FSR 3 frame
-			// generation produced one this frame (RGBA16F, rg = prevUv - uv).
-			var generated = FsrFrameGeneration.currentMotionVectors();
+			// generation or upscaling produced one this frame (RGBA16F, rg = prevUv - uv, render resolution).
+			var generated = FsrMotionVectors.currentMotionVectors();
 			return generated == null ? NeuralTextureHandle.empty() : NeuralTextureHandle.from(generated);
 		}
 

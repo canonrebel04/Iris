@@ -13,6 +13,7 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectMaps;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.anr.NeuralRendering;
 import net.irisshaders.iris.anr.fsr.FsrFrameGeneration;
+import net.irisshaders.iris.anr.fsr.FsrMotionVectors;
 import net.irisshaders.iris.compat.dh.DHCompat;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.GLDebug;
@@ -124,6 +125,8 @@ import java.util.function.Supplier;
 public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRenderingPipeline {
 	private final RenderTargets renderTargets;
 	private final PackSamplers packSamplers;
+	@Nullable
+	private FsrMotionVectors fsrMotionVectors;
 	@Nullable
 	private FsrFrameGeneration frameGeneration;
 	private final ShaderMap shaderMap;
@@ -330,8 +333,13 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			this.centerDepthSampler = new CenterDepthSampler(this.packSamplers, this.renderTargets::getDepthTexture,
 				programSet.getPackDirectives().getCenterDepthHalfLife());
 			cleanup.add(this.centerDepthSampler::destroy);
-			// FSR 3-style frame generation. Null (and fully inert) unless fsr3FrameGen=true in iris.properties.
-			this.frameGeneration = FsrFrameGeneration.createIfEnabled(this.packSamplers, this.renderTargets);
+			// FSR upscaling / FSR 3-style frame generation. All null (and fully inert) unless fsrUpscaling=true or
+			// fsr3FrameGen=true in iris.properties.
+			this.fsrMotionVectors = FsrMotionVectors.createIfNeeded(this.packSamplers, this.renderTargets);
+			if (this.fsrMotionVectors != null) {
+				cleanup.add(this.fsrMotionVectors::destroy);
+			}
+			this.frameGeneration = FsrFrameGeneration.createIfEnabled(this.packSamplers, this.fsrMotionVectors);
 			if (this.frameGeneration != null) {
 				cleanup.add(this.frameGeneration::destroy);
 			}
@@ -1088,8 +1096,8 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		renderTargets.copyPreHandDepth();
 
-		if (this.frameGeneration != null) {
-			this.frameGeneration.onPreHandDepthCopied();
+		if (this.fsrMotionVectors != null) {
+			this.fsrMotionVectors.onPreHandDepthCopied();
 		}
 	}
 
@@ -1117,8 +1125,8 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		this.compositeRenderer.renderAll();
 		this.finalPassRenderer.renderFinalPass();
 
-		if (this.frameGeneration != null) {
-			this.frameGeneration.afterFinalPass();
+		if (this.fsrMotionVectors != null) {
+			this.fsrMotionVectors.render();
 		}
 
 		NeuralRendering.afterFinalPass(this.renderTargets);
@@ -1282,6 +1290,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		if (this.frameGeneration != null) {
 			this.frameGeneration.destroy();
+		}
+
+		if (this.fsrMotionVectors != null) {
+			this.fsrMotionVectors.destroy();
 		}
 
 		customTextureManager.destroy();
