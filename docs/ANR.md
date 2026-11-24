@@ -52,7 +52,7 @@ Texture handles are graphics-API specific: an OpenGL `GLuint` or a Vulkan `VkIma
 
 Shader packs do not have a single standard colortex for motion vectors. Set `anrMotionVectorColortex` to the index your pack uses (for example `4` for `colortex4`) if you know it.
 
-A camera-only motion vector pass (reconstructing motion from current/previous view-projection and depth, with no pack support) is **not implemented**. It would need a dedicated fullscreen pass, a persistent target, and care around hand/translucent depth. That is left as a follow-up; until then, FG/SR quality will be poor or unusable if the pack does not provide motion vectors.
+When `anrMotionVectorColortex=-1` and FSR 3 frame generation is on (`fsr3FrameGen=true`), the layer receives Iris's own camera-reprojection motion vectors instead (RGBA16F, `rg = prevUv - uv`). See [FSR3.md](FSR3.md).
 
 ## Configuration (`iris.properties`)
 
