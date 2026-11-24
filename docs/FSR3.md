@@ -41,7 +41,12 @@ GameRenderer.render, after renderLevel()
 GUI / HUD is drawn
 Minecraft.renderFrame, "swapchainBlit"      (MixinMinecraft_FrameGeneration)
   FsrFrameGeneration.beforeSwapchainBlit()
-     fsr3fg/interpolate.fsh               -> frame halfway between N-1 and N, UI restored from the real frame
+     fsr3fg/fi_clear.csh, fi_scatter.csh  -> FSR 3 game motion vector field (forward scatter, image atomics) and
+                                              estimated depth of the interpolated frame        [compute, render res]
+     fsr3fg/fi_resolve.csh                -> unpacked game vectors + FSR 3 disocclusion mask  [compute, render res]
+     fsr3fg/interpolate.fsh               -> frame halfway between N-1 and N (+ inpainting weight)
+     fsr3fg/fi_pyramid.fsh x up to 10     -> colour inpainting pyramid
+     fsr3fg/fi_inpaint.fsh                -> inpaint holes, restore the UI from the real frame
      surface.blitFromTexture(generated); submit; present; [pacing]; acquireNextTexture()
 vanilla: blit real frame N; submit; present
 ```
@@ -89,11 +94,29 @@ read `ScreenSize` during the world render still see the display size.
 
 ### Interpolation (`fsr3fg/interpolate.fsh`, ported from FidelityFX SDK v1.1.4, MIT)
 
-Ported: `SampleTextureBilinear`, the game-vector branch of `computeInterpolatedColor` (disocclusion-driven
-previous/current blend and out-of-screen fallbacks), and `CalculateStaticContentFactor` for UI. Replaced: the FSR 3
-"game motion vector field" (a forward-scatter compute pass with atomics) by a backward fixed-point search on the
-camera motion vectors, and the FSR 3 disocclusion-mask pass by the depth test above. Not yet ported: optical flow and
-the inpainting pyramid (holes fall back to the current frame). Attribution: `third_party/FidelityFX/`.
+Ported (FidelityFX SDK v1.1.4, MIT; attribution in `third_party/FidelityFX/`):
+
+- **Game motion vector field** (`fi_scatter.csh`, compute): every render-resolution pixel scatters its (dilated,
+  nearest-depth) motion vector to its position in the interpolated frame with `imageAtomicMax` into two R32UI images,
+  packed exactly as FSR 3 does (primary bit, 10-bit depth priority, 5-bit luminance-similarity priority, half-float
+  vector), plus the "secondary vectors" walk. The same pass scatters depth to estimate the interpolated frame's depth.
+- **Disocclusion mask** (`fi_resolve.csh`, compute): FSR 3's `computeDisocclusionMask` / `ComputeDepthClip`
+  (minimum-separation depth test against the previous and current depth), binarized as in FSR 3.
+- **Interpolation** (`interpolate.fsh`): `SampleTextureBilinear` and the game-vector branch of
+  `computeInterpolatedColor` (disocclusion-driven previous/current blend, out-of-screen fallbacks).
+- **Inpainting** (`fi_pyramid.fsh` + `fi_inpaint.fsh`): colour pyramid (up to 10 levels) and FSR 3's
+  `ComputeInpainting` for pixels visible in neither frame, then `CalculateStaticContentFactor` UI restore against the
+  HUD-less frame.
+
+Differences: holes in the game vector field are filled by a backward fixed-point search on the motion vectors instead
+of FSR 3's motion-vector inpainting pyramid; the "previous depth" is the real previous depth buffer; the
+secondary-vector walk is capped at 256 steps. If compute shaders are unavailable (OpenGL < 4.3) or fail, or with
+`fsr3FrameGenVectorField=false`, frame generation logs a warning and uses the milestone-1 path (backward search +
+`motion.fsh` disocclusion); inpainting and UI restore still apply.
+
+Not ported: **FidelityFX optical flow** (luminance pyramid, `compute_optical_flow_v5`, filtering, scene-change
+detection). It would need roughly ten more compute passes and its own resources; without it, things that move on their
+own (mobs, particles, water) get camera motion only, and FSR 3's game-vs-optical-flow blend is skipped.
 
 ### Presenting and pacing
 
@@ -119,6 +142,7 @@ fsr3FrameGen=false            # master switch
 fsr3FrameGenPresent=true      # false = run the passes but never show generated frames
 fsr3FrameGenPacing=vsync      # vsync | sleep | none
 fsr3FrameGenDebugView=none    # none | motion | disocclusion | interpolated
+fsr3FrameGenVectorField=true  # FSR 3 game motion vector field + disocclusion mask (compute); false = simple search
 fsrUpscaling=false            # FSR 2/3-style temporal upscaling
 fsrUpscalingQuality=quality   # native_aa (1.0x) | quality (1.5x) | balanced (1.7x) | performance (2.0x) | ultra_performance (3.0x)
 fsrUpscalingSharpness=0.2     # 0..1, RCAS
@@ -126,14 +150,19 @@ fsrUpscalingSharpness=0.2     # 0..1, RCAS
 
 Debug views replace the real frame (no generated frames are presented while one is on):
 
-- `motion`: red/green = |motion x/y| (scaled 20x), blue = hand. Standing still should be black; turning the camera
-  should light up the whole screen smoothly, with the hand staying black.
-- `disocclusion`: red = disoccluded, green = detected UI, blue = inpainting fallback.
+- `motion`: red/green = |game vector x/y| used for interpolation (scaled 20x), blue = hand (search mode only).
+  Standing still should be black; turning the camera should light up the whole screen smoothly.
+- `disocclusion`: red = not visible in the previous frame, green = not visible in the current frame, blue =
+  inpainting weight.
 - `interpolated`: shows only the generated frames, to judge interpolation quality.
 
 ## Logs (`logs/latest.log`)
 
-- `[FSR3-FG] Enabled on the OpenGL backend (present=true, pacing=vsync, debugView=none).` on shader pack load
+- `[FSR3-FG] Enabled on the OpenGL backend (present=true, pacing=vsync, debugView=none, vectorField=true).` on shader
+  pack load
+- `[FSR3-FG] Allocated 1706x960 game motion vector field.` on the first generated frame / resize
+- `[FSR3-FG] The FSR 3 game motion vector field (compute shaders) is unavailable ...` or `... passes failed; falling
+  back ...`: compute path off, the simpler path keeps working
 - `[FSR3-FG] Allocated 2560x1440 frame generation targets (color RGBA8_UNORM, depth D32_FLOAT).` on first frame / resize
 - `[FSR3-FG] First generated frame (...)` once interpolation runs
 - `[FSR3-FG] The <stage> failed; frame generation is disabled until the shader pack is reloaded.` + stack trace: the
@@ -152,7 +181,7 @@ Debug views replace the real frame (no generated frames are presented while one 
 
 ## What is verified vs not
 
-Verified here (Linux box, no GPU): both jars build; all four GLSL passes are accepted by Iris's own shader patcher,
+Verified here (Linux box, no GPU): both jars build; all GLSL passes (fragment and compute) are accepted by Iris's own shader patcher,
 the Vulkan-patched output compiles to SPIR-V with glslang and the unpatched sources compile as GLSL 330; the mixin
 targets exist in the 26.3 bytecode (`ldc "swapchainBlit"` + `ProfilerFiller.push` in `Minecraft.renderFrame`,
 `renderLevel()V` in `GameRenderer.render`, `GameRenderer.mainRenderTarget`, `SkyRenderer.renderTarget` reads in
@@ -165,9 +194,10 @@ Y orientation of the reprojection on Vulkan, presenting twice per loop on both b
 
 1. **(this branch)** Camera motion vectors, HUD-less capture, depth disocclusion, ported interpolation core, UI
    restore, double present, basic pacing, debug views, config, FSR upscaling plan + settings + jitter math.
-2. FSR 3 frame-interpolation port proper: game-vector-field forward scatter (compute + image atomics), disocclusion
-   mask, inpainting pyramid (Iris already ships FidelityFX SPD), then FidelityFX optical flow (luminance pyramid,
-   `compute_optical_flow_v5`, filter, scene-change detection) so entities/particles interpolate correctly.
+2. **(done except optical flow)** FSR 3 frame-interpolation port: game-vector-field forward scatter (compute + image
+   atomics), disocclusion mask, colour inpainting pyramid. Remaining: FidelityFX optical flow (luminance pyramid,
+   `compute_optical_flow_v5`, filter, scene-change detection) so entities/particles interpolate correctly, and the
+   motion-vector inpainting pyramid.
 3. **(done)** FSR 2/3 temporal upscaling: world + pack passes at `fsrUpscalingQuality` resolution with Halton
    jitter, ported accumulate/upsample/rectify + RCAS, display-resolution result before the hand overlay, color-space
    pass and GUI. Follow-ups: locks, reactive mask from pack translucents, luma instability, mip bias for textures.
