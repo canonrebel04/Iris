@@ -9,15 +9,19 @@ import net.irisshaders.iris.config.IrisConfig;
 import net.irisshaders.iris.gl.framebuffer.ViewportData;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.sampler.SamplerHolder.TextureBinding;
+import net.irisshaders.iris.gl.texture.InternalTextureFormat;
 import net.irisshaders.iris.gl.uniform.UniformUpdateFrequency;
 import net.irisshaders.iris.pipeline.programs.CompositeProgram;
+import net.irisshaders.iris.pipeline.programs.ComputeProgram;
 import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.samplers.PackSamplers;
 import net.irisshaders.iris.targets.ColorAttachmentPlan;
 import net.minecraft.client.Minecraft;
 import org.jetbrains.annotations.Nullable;
+import org.joml.Vector3i;
 import org.joml.Vector4f;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -33,21 +37,39 @@ import java.util.Set;
  *     + depth disocclusion, at render resolution (lower than the display when {@link FsrUpscaler} is on).</li>
  *     <li>{@link #captureHudless(GpuTexture)} (after Iris's color-space pass, before the GUI is drawn, always at
  *     display resolution): copy the HUD-less scene color.</li>
- *     <li>{@link #beforeSwapchainBlit} (from Minecraft's frame loop, after the GUI): interpolate a frame halfway
- *     between N-1 and N, present it, re-acquire the swapchain, and let vanilla present the real frame N.</li>
+ *     <li>{@link #beforeSwapchainBlit} (from Minecraft's frame loop, after the GUI): build the FSR 3 game motion
+ *     vector field and disocclusion mask (compute: fi_clear/fi_scatter/fi_resolve), interpolate a frame halfway between
+ *     N-1 and N (interpolate.fsh), inpaint holes from a colour pyramid and restore the UI (fi_pyramid/fi_inpaint),
+ *     present it, re-acquire the swapchain, and let vanilla present the real frame N.</li>
  * </ol>
+ *
+ * <p>Without compute shaders (or with {@code fsr3FrameGenVectorField=false}) the vector field is replaced by a
+ * backward search on the motion vectors; everything else is the same.</p>
  *
  * <p>Everything is created only when {@code fsr3FrameGen=true}; otherwise no instance exists and no hook does
  * anything.</p>
  */
 public final class FsrFrameGeneration {
 	private static final String LOG_PREFIX = "[FSR3-FG] ";
+	private static final int MAX_PYRAMID_LEVELS = 10;
+	private static final int STORAGE_USAGE = net.irisshaders.iris.targets.RenderTarget.USAGE_STORAGE | GpuTexture.USAGE_TEXTURE_BINDING
+		| GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_COPY_SRC;
 
 	@Nullable
 	private static FsrFrameGeneration active;
 
 	private final FsrMotionVectors motion;
 	private final CompositeProgram interpolateProgram;
+	private final CompositeProgram pyramidProgram;
+	private final CompositeProgram inpaintProgram;
+	// FSR 3 game motion vector field (null when disabled or unavailable)
+	@Nullable
+	private ComputeProgram clearProgram;
+	@Nullable
+	private ComputeProgram scatterProgram;
+	@Nullable
+	private ComputeProgram resolveProgram;
+	private boolean vectorField;
 	private final FsrFramePacing pacing;
 	private final FsrDebugView debugView;
 	private final boolean present;
@@ -59,11 +81,38 @@ public final class FsrFrameGeneration {
 	private GpuTextureView finalCopyView;
 	private GpuTexture output;
 	private GpuTextureView outputView;
+	private GpuTexture interpolated;
+	private GpuTextureView interpolatedView;
+	private final GpuTexture[] pyramid = new GpuTexture[MAX_PYRAMID_LEVELS];
+	private final GpuTextureView[] pyramidViews = new GpuTextureView[MAX_PYRAMID_LEVELS];
+	private int pyramidLevels;
+	private GpuTextureView pyramidSource;
 	private int width = -1;
 	private int height = -1;
 	private GpuFormat colorFormat;
 
 	private final Vector4f interpolateSettings = new Vector4f();
+	private final Vector4f pyramidParams = new Vector4f();
+	private final Vector4f inpaintParams = new Vector4f();
+	private final Vector4f fieldSizes = new Vector4f();
+	private final Vector4f fieldDepthParams = new Vector4f();
+
+	// Render-resolution vector field resources
+	private GpuTexture fieldX;
+	private GpuTextureView fieldXView;
+	private GpuTexture fieldY;
+	private GpuTextureView fieldYView;
+	private GpuTexture interpDepth;
+	private GpuTextureView interpDepthView;
+	private GpuTexture vectors;
+	private GpuTextureView vectorsView;
+	private GpuTexture fieldPrevDepth;
+	private GpuTextureView fieldPrevDepthView;
+	private int fieldWidth = -1;
+	private int fieldHeight = -1;
+	private GpuFormat fieldDepthFormat;
+	private boolean hasFieldPrevDepth;
+	private boolean loggedFieldFailure;
 
 	private long hudlessFrame = -1;
 	private long previousHudlessFrame = -2;
@@ -85,13 +134,16 @@ public final class FsrFrameGeneration {
 		this.present = config.shouldPresentFsr3GeneratedFrames();
 
 		String vertex = FsrShaders.read("/fsr3fg/fullscreen.vsh");
-		var interpolateOutputs = new ColorAttachmentPlan.Builder().program("fsr3fg_interpolate", new int[]{0}, Set.of()).build(1)
-			.program("fsr3fg_interpolate");
-		this.interpolateProgram = new CompositeProgram(samplers, "fsr3fg_interpolate",
-			Map.of(PatchShaderType.VERTEX, vertex, PatchShaderType.FRAGMENT, FsrShaders.read("/fsr3fg/interpolate.fsh")),
-			interpolateOutputs, Collections.singletonList(null));
+		var cleanup = new ArrayList<Runnable>();
+		this.interpolateProgram = fullscreen(samplers, "fsr3fg_interpolate", vertex, "/fsr3fg/interpolate.fsh");
+		cleanup.add(this.interpolateProgram::destroy);
 
 		try {
+			this.pyramidProgram = fullscreen(samplers, "fsr3fg_pyramid", vertex, "/fsr3fg/fi_pyramid.fsh");
+			cleanup.add(this.pyramidProgram::destroy);
+			this.inpaintProgram = fullscreen(samplers, "fsr3fg_inpaint", vertex, "/fsr3fg/fi_inpaint.fsh");
+			cleanup.add(this.inpaintProgram::destroy);
+
 			this.interpolateProgram.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgSettings", () -> this.interpolateSettings);
 			var interpolateSamplers = this.interpolateProgram.getSamplers();
 			interpolateSamplers.addDrawTextureSampler(
@@ -103,13 +155,129 @@ public final class FsrFrameGeneration {
 			// Motion is at render resolution and may be smaller than the display; the shader samples it with normalized UVs.
 			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/motion", this.motion::view, () -> GlSampler.NEAREST),
 				false, "fgMotion");
-			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/finalColor", () -> this.finalCopyView, () -> GlSampler.NEAREST),
-				false, "fgFinalColor");
+			interpolateSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/vectors", () -> this.vectorsView != null ? this.vectorsView
+				: this.motion.view(), () -> GlSampler.NEAREST), false, "fgVectors");
 			interpolateSamplers.finish();
+
+			this.pyramidProgram.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgPyramidParams", () -> this.pyramidParams);
+			var pyramidSamplers = this.pyramidProgram.getSamplers();
+			pyramidSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/pyramidSource", () -> this.pyramidSource, () -> GlSampler.NEAREST),
+				false, "fgPyramidSource");
+			pyramidSamplers.finish();
+
+			this.inpaintProgram.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgInpaintParams", () -> this.inpaintParams);
+			var inpaintSamplers = this.inpaintProgram.getSamplers();
+			inpaintSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/interpolated", () -> this.interpolatedView, () -> GlSampler.NEAREST),
+				false, "fgInterpolated");
+			inpaintSamplers.addDrawTextureSampler(
+				new TextureBinding("fsr3fg/inpaintCurrent", () -> this.hudlessViews[this.currentHudless], () -> GlSampler.NEAREST), false,
+				"fgCurrColor");
+			inpaintSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/finalColor", () -> this.finalCopyView, () -> GlSampler.NEAREST),
+				false, "fgFinalColor");
+
+			for (int i = 0; i < MAX_PYRAMID_LEVELS; i++) {
+				final int level = i;
+				inpaintSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/pyramid" + i, () -> this.pyramidView(level), () -> GlSampler.NEAREST),
+					false, "fgPyramid" + i);
+			}
+
+			inpaintSamplers.finish();
+
+			if (config.isFsr3FrameGenVectorFieldEnabled()) {
+				this.createVectorFieldPrograms(samplers);
+			}
 		} catch (RuntimeException | Error e) {
-			this.interpolateProgram.destroy();
+			for (var close : cleanup.reversed()) {
+				try {
+					close.run();
+				} catch (RuntimeException | Error suppressed) {
+					e.addSuppressed(suppressed);
+				}
+			}
+
 			throw e;
 		}
+	}
+
+	private static CompositeProgram fullscreen(PackSamplers samplers, String name, String vertex, String fragment) {
+		var outputs = new ColorAttachmentPlan.Builder().program(name, new int[]{0}, Set.of()).build(1).program(name);
+		return new CompositeProgram(samplers, name, Map.of(PatchShaderType.VERTEX, vertex, PatchShaderType.FRAGMENT, FsrShaders.read(fragment)),
+			outputs, Collections.singletonList(null));
+	}
+
+	/** Pyramid levels beyond the allocated count repeat the last level (the shader never reads them). */
+	@Nullable
+	private GpuTextureView pyramidView(int level) {
+		if (this.pyramidLevels == 0) {
+			return this.interpolatedView;
+		}
+
+		return this.pyramidViews[Math.min(level, this.pyramidLevels - 1)];
+	}
+
+	private void createVectorFieldPrograms(PackSamplers samplers) {
+		ComputeProgram clear = null;
+		ComputeProgram scatter = null;
+		ComputeProgram resolve = null;
+
+		try {
+			clear = new ComputeProgram(samplers, "fsr3fg_fi_clear", FsrShaders.read("/fsr3fg/fi_clear.csh"));
+			this.addFieldImages(clear);
+			clear.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgSizes", () -> this.fieldSizes);
+			clear.getSamplers().finish();
+
+			scatter = new ComputeProgram(samplers, "fsr3fg_fi_scatter", FsrShaders.read("/fsr3fg/fi_scatter.csh"));
+			this.addFieldImages(scatter);
+			scatter.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgSizes", () -> this.fieldSizes);
+			scatter.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgDepthParams", () -> this.fieldDepthParams);
+			var scatterSamplers = scatter.getSamplers();
+			scatterSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/fiMotion", this.motion::view, () -> GlSampler.NEAREST), false,
+				"fgMotion");
+			scatterSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/fiDepth", this.motion::depthCopyView, () -> GlSampler.NEAREST),
+				false, "fgDepth");
+			scatterSamplers.addDrawTextureSampler(
+				new TextureBinding("fsr3fg/fiPrevColor", () -> this.hudlessViews[1 - this.currentHudless], () -> GlSampler.LINEAR), false,
+				"fgPrevColor");
+			scatterSamplers.addDrawTextureSampler(
+				new TextureBinding("fsr3fg/fiCurrColor", () -> this.hudlessViews[this.currentHudless], () -> GlSampler.LINEAR), false,
+				"fgCurrColor");
+			scatterSamplers.finish();
+
+			resolve = new ComputeProgram(samplers, "fsr3fg_fi_resolve", FsrShaders.read("/fsr3fg/fi_resolve.csh"));
+			this.addFieldImages(resolve);
+			resolve.getSamplers().addTextureImage(() -> this.vectorsView, InternalTextureFormat.RGBA16F, "fgVectors");
+			resolve.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgSizes", () -> this.fieldSizes);
+			resolve.getUniforms().uniform4f(UniformUpdateFrequency.CUSTOM, "fgDepthParams", () -> this.fieldDepthParams);
+			var resolveSamplers = resolve.getSamplers();
+			resolveSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/fiResolveMotion", this.motion::view, () -> GlSampler.NEAREST),
+				false, "fgMotion");
+			resolveSamplers.addDrawTextureSampler(new TextureBinding("fsr3fg/fiResolveDepth", this.motion::depthCopyView, () -> GlSampler.NEAREST),
+				false, "fgDepth");
+			resolveSamplers.addDrawTextureSampler(
+				new TextureBinding("fsr3fg/fiPrevDepth", () -> this.fieldPrevDepthView, () -> GlSampler.NEAREST), false, "fgPrevDepth");
+			resolveSamplers.finish();
+
+			this.clearProgram = clear;
+			this.scatterProgram = scatter;
+			this.resolveProgram = resolve;
+			this.vectorField = true;
+		} catch (RuntimeException | Error e) {
+			for (var program : new ComputeProgram[]{clear, scatter, resolve}) {
+				if (program != null) {
+					program.destroy();
+				}
+			}
+
+			Iris.logger.warn(LOG_PREFIX + "The FSR 3 game motion vector field (compute shaders) is unavailable; using the backward "
+				+ "motion-vector search instead.", e);
+		}
+	}
+
+	private void addFieldImages(ComputeProgram program) {
+		var images = program.getSamplers();
+		images.addTextureImage(() -> this.fieldXView, InternalTextureFormat.R32UI, "fgFieldX");
+		images.addTextureImage(() -> this.fieldYView, InternalTextureFormat.R32UI, "fgFieldY");
+		images.addTextureImage(() -> this.interpDepthView, InternalTextureFormat.R32UI, "fgInterpDepth");
 	}
 
 	/**
@@ -134,9 +302,9 @@ public final class FsrFrameGeneration {
 		try {
 			var generator = new FsrFrameGeneration(samplers, motion, config);
 			active = generator;
-			Iris.logger.info(LOG_PREFIX + "Enabled on the {} backend (present={}, pacing={}, debugView={}).",
+			Iris.logger.info(LOG_PREFIX + "Enabled on the {} backend (present={}, pacing={}, debugView={}, vectorField={}).",
 				RenderSystem.getDevice().getDeviceInfo().backendName(), generator.present, generator.pacing.configName(),
-				generator.debugView.configName());
+				generator.debugView.configName(), generator.vectorField);
 			return generator;
 		} catch (RuntimeException e) {
 			Iris.logger.error(LOG_PREFIX + "Setup failed; frame generation is disabled for this shader pack.", e);
@@ -211,6 +379,15 @@ public final class FsrFrameGeneration {
 			return;
 		}
 
+		try {
+			this.interpolateAndPresent(surface, frame);
+		} finally {
+			// The vector field's disocclusion test needs the previous frame's depth.
+			this.keepFieldDepth();
+		}
+	}
+
+	private void interpolateAndPresent(com.mojang.renderpearl.api.device.GpuSurface surface, long frame) {
 		boolean consecutive = this.previousHudlessFrame == frame - 1;
 		this.interpolateSettings.set(this.debugView.shaderId(), consecutive ? this.framesSinceReset : 0, 0, 0);
 		this.framesSinceReset = consecutive ? this.framesSinceReset + 1 : 0;
@@ -229,7 +406,20 @@ public final class FsrFrameGeneration {
 
 			var encoder = RenderSystem.getDevice().createCommandEncoder();
 			encoder.copyTextureToTexture(mainColor, this.finalCopy, 0, 0, 0, 0, 0, this.width, this.height);
-			this.interpolateProgram.draw(List.of(this.outputView), ViewportData.defaultValue(), 0, ++this.drawCounter);
+
+			boolean field = consecutive && this.buildVectorField();
+			this.interpolateSettings.z = field ? 1 : 0;
+			this.interpolateProgram.draw(List.of(this.interpolatedView), ViewportData.defaultValue(), 0, ++this.drawCounter);
+
+			// Colour inpainting pyramid, then inpainting + UI restore into the presented image.
+			for (int i = 0; i < this.pyramidLevels; i++) {
+				this.pyramidSource = i == 0 ? this.interpolatedView : this.pyramidViews[i - 1];
+				this.pyramidParams.set(i == 0 ? 1 : 0, 0, 0, 0);
+				this.pyramidProgram.draw(List.of(this.pyramidViews[i]), ViewportData.defaultValue(), 0, ++this.drawCounter);
+			}
+
+			this.inpaintParams.set(this.pyramidLevels, 0, 0, 0);
+			this.inpaintProgram.draw(List.of(this.outputView), ViewportData.defaultValue(), 0, ++this.drawCounter);
 
 			if (!this.loggedFirstFrame) {
 				this.loggedFirstFrame = true;
@@ -261,6 +451,110 @@ public final class FsrFrameGeneration {
 		} catch (RuntimeException e) {
 			this.fail("interpolation/present", e);
 		}
+	}
+
+	/** Runs the FSR 3 game-vector-field passes. Returns false (search fallback) when disabled or on failure. */
+	private boolean buildVectorField() {
+		if (!this.vectorField || this.clearProgram == null) {
+			return false;
+		}
+
+		try {
+			GpuTexture depth = this.motion.depthCopy();
+			GpuTextureView motionView = this.motion.view();
+
+			if (depth == null || motionView == null) {
+				return false;
+			}
+
+			this.ensureFieldResources(depth);
+			int w = this.fieldWidth;
+			int h = this.fieldHeight;
+			Vector4f params = this.motion.depthParams();
+			this.fieldSizes.set(w, h, this.width, this.height);
+			this.fieldDepthParams.set(params.x, params.y, params.z, this.hasFieldPrevDepth ? 1 : 0);
+
+			var groups = new Vector3i((w + 7) / 8, (h + 7) / 8, 1);
+			this.clearProgram.dispatch(groups, 0, ++this.drawCounter);
+			this.scatterProgram.dispatch(groups, 0, ++this.drawCounter);
+			this.resolveProgram.dispatch(groups, 0, ++this.drawCounter);
+			return true;
+		} catch (RuntimeException e) {
+			this.vectorField = false;
+
+			if (!this.loggedFieldFailure) {
+				this.loggedFieldFailure = true;
+				Iris.logger.warn(LOG_PREFIX + "The game motion vector field passes failed; falling back to the backward motion-vector search.", e);
+			}
+
+			return false;
+		}
+	}
+
+	private void keepFieldDepth() {
+		if (!this.vectorField || this.fieldPrevDepth == null) {
+			return;
+		}
+
+		try {
+			GpuTexture depth = this.motion.depthCopy();
+
+			if (depth != null && depth.getWidth(0) == this.fieldWidth && depth.getHeight(0) == this.fieldHeight
+				&& depth.getFormat() == this.fieldDepthFormat) {
+				RenderSystem.getDevice().createCommandEncoder()
+					.copyTextureToTexture(depth, this.fieldPrevDepth, 0, 0, 0, 0, 0, this.fieldWidth, this.fieldHeight);
+				this.hasFieldPrevDepth = true;
+			}
+		} catch (RuntimeException e) {
+			this.hasFieldPrevDepth = false;
+		}
+	}
+
+	private void ensureFieldResources(GpuTexture depth) {
+		int w = depth.getWidth(0);
+		int h = depth.getHeight(0);
+
+		if (w == this.fieldWidth && h == this.fieldHeight && depth.getFormat() == this.fieldDepthFormat && this.vectors != null) {
+			return;
+		}
+
+		this.closeFieldTextures();
+		var device = RenderSystem.getDevice();
+		this.fieldWidth = w;
+		this.fieldHeight = h;
+		this.fieldDepthFormat = depth.getFormat();
+		this.fieldX = device.createTexture("Iris FSR3 FG vector field X", STORAGE_USAGE, GpuFormat.R32_UINT, w, h, 1, 1);
+		this.fieldXView = device.createTextureView(this.fieldX);
+		this.fieldY = device.createTexture("Iris FSR3 FG vector field Y", STORAGE_USAGE, GpuFormat.R32_UINT, w, h, 1, 1);
+		this.fieldYView = device.createTextureView(this.fieldY);
+		this.interpDepth = device.createTexture("Iris FSR3 FG interpolated depth", STORAGE_USAGE, GpuFormat.R32_UINT, w, h, 1, 1);
+		this.interpDepthView = device.createTextureView(this.interpDepth);
+		this.vectors = device.createTexture("Iris FSR3 FG vectors", STORAGE_USAGE, GpuFormat.RGBA16_FLOAT, w, h, 1, 1);
+		this.vectorsView = device.createTextureView(this.vectors);
+		this.fieldPrevDepth = device.createTexture("Iris FSR3 FG previous depth", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
+			this.fieldDepthFormat, w, h, 1, 1);
+		this.fieldPrevDepthView = device.createTextureView(this.fieldPrevDepth, 0, 1);
+		this.hasFieldPrevDepth = false;
+		Iris.logger.info(LOG_PREFIX + "Allocated {}x{} game motion vector field.", w, h);
+	}
+
+	private void closeFieldTextures() {
+		for (var view : new GpuTextureView[]{this.fieldXView, this.fieldYView, this.interpDepthView, this.vectorsView, this.fieldPrevDepthView}) {
+			if (view != null) {
+				view.close();
+			}
+		}
+
+		for (var texture : new GpuTexture[]{this.fieldX, this.fieldY, this.interpDepth, this.vectors, this.fieldPrevDepth}) {
+			if (texture != null) {
+				texture.close();
+			}
+		}
+
+		this.fieldXView = this.fieldYView = this.interpDepthView = this.vectorsView = this.fieldPrevDepthView = null;
+		this.fieldX = this.fieldY = this.interpDepth = this.vectors = this.fieldPrevDepth = null;
+		this.fieldWidth = this.fieldHeight = -1;
+		this.hasFieldPrevDepth = false;
 	}
 
 	private void pace(long generatedPresentNanos) {
@@ -319,12 +613,28 @@ public final class FsrFrameGeneration {
 		this.finalCopyView = device.createTextureView(this.finalCopy);
 		this.output = device.createTexture("Iris FSR3 FG output", FsrMotionVectors.COLOR_USAGE, this.colorFormat, w, h, 1, 1);
 		this.outputView = device.createTextureView(this.output);
+		this.interpolated = device.createTexture("Iris FSR3 FG interpolated", FsrMotionVectors.COLOR_USAGE, GpuFormat.RGBA16_FLOAT, w, h, 1, 1);
+		this.interpolatedView = device.createTextureView(this.interpolated);
+
+		int levelWidth = w;
+		int levelHeight = h;
+		this.pyramidLevels = 0;
+
+		while (this.pyramidLevels < MAX_PYRAMID_LEVELS && (levelWidth > 1 || levelHeight > 1)) {
+			levelWidth = Math.max(1, levelWidth / 2);
+			levelHeight = Math.max(1, levelHeight / 2);
+			int i = this.pyramidLevels++;
+			this.pyramid[i] = device.createTexture("Iris FSR3 FG inpainting pyramid " + i, FsrMotionVectors.COLOR_USAGE, GpuFormat.RGBA16_FLOAT,
+				levelWidth, levelHeight, 1, 1);
+			this.pyramidViews[i] = device.createTextureView(this.pyramid[i]);
+		}
 
 		this.resetHistory("resize");
 		Iris.logger.info(LOG_PREFIX + "Allocated {}x{} frame generation targets (color {}).", w, h, this.colorFormat);
 	}
 
 	private void resetHistory(String reason) {
+		this.hasFieldPrevDepth = false;
 		this.previousHudlessFrame = -2;
 		this.framesSinceReset = 0;
 		this.historyResetFrame = FsrFrameState.frameIndex();
@@ -341,17 +651,36 @@ public final class FsrFrameGeneration {
 	}
 
 	private void closeTextures() {
-		for (var view : new GpuTextureView[]{this.hudlessViews[0], this.hudlessViews[1], this.finalCopyView, this.outputView}) {
+		for (var view : new GpuTextureView[]{this.hudlessViews[0], this.hudlessViews[1], this.finalCopyView, this.outputView,
+			this.interpolatedView}) {
 			if (view != null) {
 				view.close();
 			}
 		}
 
-		for (var texture : new GpuTexture[]{this.hudless[0], this.hudless[1], this.finalCopy, this.output}) {
+		for (var texture : new GpuTexture[]{this.hudless[0], this.hudless[1], this.finalCopy, this.output, this.interpolated}) {
 			if (texture != null) {
 				texture.close();
 			}
 		}
+
+		for (int i = 0; i < MAX_PYRAMID_LEVELS; i++) {
+			if (this.pyramidViews[i] != null) {
+				this.pyramidViews[i].close();
+			}
+
+			if (this.pyramid[i] != null) {
+				this.pyramid[i].close();
+			}
+
+			this.pyramidViews[i] = null;
+			this.pyramid[i] = null;
+		}
+
+		this.pyramidLevels = 0;
+		this.pyramidSource = null;
+		this.interpolatedView = null;
+		this.interpolated = null;
 
 		this.finalCopyView = this.outputView = null;
 		this.hudlessViews[0] = this.hudlessViews[1] = null;
@@ -371,6 +700,16 @@ public final class FsrFrameGeneration {
 		}
 
 		this.interpolateProgram.destroy();
+		this.pyramidProgram.destroy();
+		this.inpaintProgram.destroy();
+
+		for (var program : new ComputeProgram[]{this.clearProgram, this.scatterProgram, this.resolveProgram}) {
+			if (program != null) {
+				program.destroy();
+			}
+		}
+
 		this.closeTextures();
+		this.closeFieldTextures();
 	}
 }

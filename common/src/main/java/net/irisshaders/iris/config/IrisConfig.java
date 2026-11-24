@@ -76,6 +76,11 @@ public class IrisConfig {
 	private boolean fsr3FrameGenPresent;
 	private FsrFramePacing fsr3FrameGenPacing;
 	private FsrDebugView fsr3FrameGenDebugView;
+	/**
+	 * Use the ported FSR 3 forward-scatter game motion vector field, disocclusion mask and inpainting (compute shaders).
+	 * When false, or when compute shaders are unavailable, frame generation uses the simpler backward search.
+	 */
+	private boolean fsr3FrameGenVectorField;
 	/** FSR 2/3-style temporal upscaling (needs a shader pack). Off by default. */
 	private boolean fsrUpscaling;
 	private FsrUpscalingQuality fsrUpscalingQuality;
@@ -99,6 +104,7 @@ public class IrisConfig {
 		fsr3FrameGenPresent = true;
 		fsr3FrameGenPacing = FsrFramePacing.VSYNC;
 		fsr3FrameGenDebugView = FsrDebugView.NONE;
+		fsr3FrameGenVectorField = true;
 		fsrUpscaling = false;
 		fsrUpscalingQuality = FsrUpscalingQuality.QUALITY;
 		fsrUpscalingSharpness = 0.2f;
@@ -237,6 +243,7 @@ public class IrisConfig {
 		fsr3FrameGenPresent = !"false".equals(properties.getProperty("fsr3FrameGenPresent"));
 		fsr3FrameGenPacing = FsrFramePacing.fromConfig(properties.getProperty("fsr3FrameGenPacing", "vsync"));
 		fsr3FrameGenDebugView = FsrDebugView.fromConfig(properties.getProperty("fsr3FrameGenDebugView", "none"));
+		fsr3FrameGenVectorField = !"false".equals(properties.getProperty("fsr3FrameGenVectorField"));
 		fsrUpscaling = "true".equals(properties.getProperty("fsrUpscaling"));
 		fsrUpscalingQuality = FsrUpscalingQuality.fromConfig(properties.getProperty("fsrUpscalingQuality", "quality"));
 		try {
@@ -286,6 +293,7 @@ public class IrisConfig {
 		properties.setProperty("fsr3FrameGenPresent", Boolean.toString(fsr3FrameGenPresent));
 		properties.setProperty("fsr3FrameGenPacing", fsr3FrameGenPacing.configName());
 		properties.setProperty("fsr3FrameGenDebugView", fsr3FrameGenDebugView.configName());
+		properties.setProperty("fsr3FrameGenVectorField", Boolean.toString(fsr3FrameGenVectorField));
 		properties.setProperty("fsrUpscaling", Boolean.toString(fsrUpscaling));
 		properties.setProperty("fsrUpscalingQuality", fsrUpscalingQuality.configName());
 		properties.setProperty("fsrUpscalingSharpness", Float.toString(fsrUpscalingSharpness));
@@ -356,6 +364,10 @@ public class IrisConfig {
 
 	public FsrDebugView getFsr3FrameGenDebugView() {
 		return fsr3FrameGenDebugView;
+	}
+
+	public boolean isFsr3FrameGenVectorFieldEnabled() {
+		return fsr3FrameGenVectorField;
 	}
 
 	public boolean isFsrUpscalingEnabled() {

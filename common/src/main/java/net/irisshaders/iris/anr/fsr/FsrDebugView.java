@@ -6,9 +6,10 @@ import java.util.Locale;
 public enum FsrDebugView {
 	/** Normal output. */
 	NONE(0),
-	/** Show the camera-reprojection motion vectors (red/green = x/y, blue = hand / static). */
+	/** Show the motion vectors used for interpolation (red/green = |x|/|y|, blue = hand or inpainted vector). */
 	MOTION(1),
-	/** Show the disocclusion mask (red = disoccluded in the previous frame, green = UI detected). */
+	/** Show the disocclusion mask (red = not visible in the previous frame, green = not visible in the current frame,
+	 * blue = inpainted). */
 	DISOCCLUSION(2),
 	/** Replace every real frame with the generated one, so interpolation artifacts are easy to see. */
 	INTERPOLATED(3);

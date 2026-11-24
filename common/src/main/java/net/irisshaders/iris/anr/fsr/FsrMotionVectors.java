@@ -61,6 +61,7 @@ public final class FsrMotionVectors {
 	private int height = -1;
 	private GpuFormat depthFormat;
 
+	private final Vector4f depthParams = new Vector4f();
 	private final Matrix4f reprojection = new Matrix4f();
 	private final Vector4f motionParams = new Vector4f();
 	private final Vector4f jitterParams = new Vector4f();
@@ -157,6 +158,25 @@ public final class FsrMotionVectors {
 		return this.depthView;
 	}
 
+	/** After {@link #render()}: a copy of this frame's raw depth (render resolution), valid until the next render. */
+	@Nullable
+	GpuTexture depthCopy() {
+		return this.previousDepth;
+	}
+
+	@Nullable
+	GpuTextureView depthCopyView() {
+		return this.previousDepthView;
+	}
+
+	/**
+	 * This frame's un-jittered projection as FSR 3 needs it: x = m22, y = m32 (OpenGL-style, for view distance from
+	 * depth), z = Kfov (length of a view ray through the screen corner / through the centre).
+	 */
+	Vector4f depthParams() {
+		return this.depthParams;
+	}
+
 	public void onPreHandDepthCopied() {
 		this.handDepthValid = true;
 	}
@@ -212,6 +232,8 @@ public final class FsrMotionVectors {
 
 			this.previousView.set(view);
 			this.previousProjection.set(unjittered);
+			this.depthParams.set(unjittered.m22(), unjittered.m32(),
+				(float) Math.sqrt(1.0 + 1.0 / (unjittered.m00() * unjittered.m00()) + 1.0 / (unjittered.m11() * unjittered.m11())), 0);
 			this.previousCamera.set(camera);
 			this.previousJitterUvX = jitterX * 0.5f;
 			this.previousJitterUvY = jitterY * 0.5f;

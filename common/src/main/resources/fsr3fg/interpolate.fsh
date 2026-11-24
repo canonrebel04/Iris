@@ -26,22 +26,23 @@
 //   sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation.h        (SampleTextureBilinear,
 //       computeInterpolatedColor game-vector branch, computeFrameinterpolation)
 //   sdk/include/FidelityFX/gpu/frameinterpolation/ffx_frameinterpolation_common.h (GetBilinearSamplingData,
-//       IsInRect, MinDividedByMax, CalculateStaticContentFactor)
+//       IsInRect)
 // Modifications by the Iris contributors:
-//   - The FSR 3 "game motion vector field" (built by a forward-scatter compute pass) is replaced by a
-//     backward fixed-point search on the camera-reprojection motion vectors produced by motion.fsh.
-//   - The FSR 3 disocclusion mask pass is replaced by the depth test in motion.fsh.
-//   - The optical-flow branch and the inpainting pyramid are not ported yet; fully disoccluded pixels fall
-//     back to the current frame.
-//   - UI is restored with CalculateStaticContentFactor against the HUD-less frame, as FSR 3 does when an
-//     application provides a HUD-less color buffer.
+//   - Game vectors and the disocclusion mask come from fi_scatter.csh / fi_resolve.csh (ported FSR 3 game motion
+//     vector field + disocclusion mask) through fgVectors. Without compute shaders (or with
+//     fsr3FrameGenVectorField=false) they fall back to a backward fixed-point search on the camera-reprojection motion
+//     vectors from motion.fsh and its depth-test disocclusion.
+//   - The optical-flow branch is not ported (game vectors only).
+//   - Output is RGBA16F: rgb = interpolated colour, a = inpainting weight (FSR 3 StoreFrameinterpolationOutput);
+//     inpainting and the UI restore run in fi_inpaint.fsh. Debug views write a = -1.
 // See third_party/FidelityFX/LICENSE.txt.
 
 uniform sampler2D fgPrevColor;  // HUD-less color of the previous real frame
 uniform sampler2D fgCurrColor;  // HUD-less color of the current real frame
 uniform sampler2D fgMotion;     // output of motion.fsh for the current frame
-uniform sampler2D fgFinalColor; // current real frame including GUI/HUD
-uniform vec4 fgSettings;        // x = debug view (0 none, 1 motion, 2 disocclusion, 3 interpolated), y = frames since reset
+uniform sampler2D fgVectors;    // fi_resolve.csh output (render resolution), used when fgSettings.z = 1
+uniform vec4 fgSettings;        // x = debug view (0 none, 1 motion, 2 disocclusion, 3 interpolated), y = frames since reset,
+                                // z = 1 when fgVectors is valid
 
 in vec2 uv;
 out vec4 outColor;
@@ -74,21 +75,6 @@ BilinearSamplingData GetBilinearSamplingData(vec2 fUv, ivec2 iSize) {
 
 bool IsInRect(ivec2 pos, ivec2 iRectCorner, ivec2 iRectSize) {
     return (pos.x >= iRectCorner.x && pos.x < (iRectSize.x + iRectCorner.x) && pos.y >= iRectCorner.y && pos.y < (iRectSize.y + iRectCorner.y));
-}
-
-float MinDividedByMax(float v0, float v1) {
-    float m = max(v0, v1);
-    return m != 0.0 ? min(v0, v1) / m : 0.0;
-}
-
-float CalculateStaticContentFactor(vec3 fCurrentInterpolationSource, vec3 fPresentColor) {
-    vec3 fFactor = clamp(vec3(
-        clamp((1.0 - MinDividedByMax(fCurrentInterpolationSource.r, fPresentColor.r)) / 0.1, 0.0, 1.0),
-        clamp((1.0 - MinDividedByMax(fCurrentInterpolationSource.g, fPresentColor.g)) / 0.1, 0.0, 1.0),
-        clamp((1.0 - MinDividedByMax(fCurrentInterpolationSource.b, fPresentColor.b)) / 0.1, 0.0, 1.0)
-    ), 0.0, 1.0);
-
-    return max(fFactor.x, max(fFactor.y, fFactor.z));
 }
 
 struct InterpolationSourceColor {
@@ -145,14 +131,28 @@ vec4 findGameVector(vec2 fUv) {
     return vec4(0.5 * motion.xy, motion.z, motion.w);
 }
 
+// Returns xy = half game vector (interpolated -> previous), zw = disocclusion factor (x = 1: visible in the previous
+// frame, y = 1: visible in the current frame).
+vec4 loadGameVectorAndDisocclusion(vec2 fUv, out float hand) {
+    if (fgSettings.z > 0.5) {
+        vec4 v = texture(fgVectors, fUv);
+        hand = 0.0;
+        // Binarize disocclusion factor
+        return vec4(v.xy, vec2(equal(clamp(v.zw, 0.0, 1.0), vec2(1.0))));
+    }
+
+    vec4 gameMv = findGameVector(fUv);
+    hand = gameMv.w;
+    return vec4(gameMv.xy, 1.0 - gameMv.z, 1.0);
+}
+
 vec3 computeInterpolatedColor(vec2 fUvInScreenSpace, ivec2 texSize, vec4 gameMv, out float fInPaintingWeight) {
     fInPaintingWeight = 0.0;
 
     bool bPosOutside = !insideUv(fUvInScreenSpace + gameMv.xy);
     bool bNegOutside = !insideUv(fUvInScreenSpace - gameMv.xy);
 
-    // x = 1: the interpolated pixel is visible in the previous frame, y = 1: visible in the current frame.
-    vec2 fDisocclusionFactor = vec2(1.0 - gameMv.z, 1.0);
+    vec2 fDisocclusionFactor = gameMv.zw;
 
     InterpolationSourceColor fPrevColorGame = SampleTextureBilinear(false, fUvInScreenSpace, +gameMv.xy, texSize);
     InterpolationSourceColor fCurrColorGame = SampleTextureBilinear(true, fUvInScreenSpace, -gameMv.xy, texSize);
@@ -186,7 +186,8 @@ void main() {
     ivec2 iPxPos = clamp(ivec2(uv * vec2(texSize)), ivec2(0), texSize - 1);
     int debugView = int(fgSettings.x + 0.5);
 
-    vec4 gameMv = findGameVector(uv);
+    float hand;
+    vec4 gameMv = loadGameVectorAndDisocclusion(uv, hand);
     vec3 fColor;
     float fInPaintingWeight = 0.0;
 
@@ -195,28 +196,18 @@ void main() {
         fColor = texelFetch(fgCurrColor, iPxPos, 0).rgb;
     } else {
         fColor = computeInterpolatedColor(uv, texSize, gameMv, fInPaintingWeight);
-
-        if (fInPaintingWeight > 0.0) {
-            // Inpainting pyramid not ported yet: fall back to the current frame.
-            fColor = mix(fColor, texelFetch(fgCurrColor, iPxPos, 0).rgb, fInPaintingWeight);
-        }
     }
-
-    // Restore UI: wherever the presented frame differs from the HUD-less frame, show the presented frame.
-    vec3 hudless = texelFetch(fgCurrColor, iPxPos, 0).rgb;
-    vec3 present = texelFetch(fgFinalColor, iPxPos, 0).rgb;
-    float staticFactor = CalculateStaticContentFactor(hudless, present);
 
     if (debugView == 1) {
         vec2 mv = 2.0 * gameMv.xy;
-        outColor = vec4(clamp(abs(mv) * 20.0, 0.0, 1.0), gameMv.w, 1.0);
+        outColor = vec4(clamp(abs(mv) * 20.0, 0.0, 1.0), hand, -1.0);
         return;
     }
 
     if (debugView == 2) {
-        outColor = vec4(gameMv.z, staticFactor, fInPaintingWeight, 1.0);
+        outColor = vec4(1.0 - gameMv.z, 1.0 - gameMv.w, fInPaintingWeight, -1.0);
         return;
     }
 
-    outColor = vec4(mix(fColor, present, staticFactor), 1.0);
+    outColor = vec4(fColor, fInPaintingWeight);
 }
