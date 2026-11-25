@@ -85,6 +85,7 @@
     "MixinShaderManager_Overrides",
     "MixinSkyRenderer",
     "MixinSkyRenderer_Upscaling",
+    "MixinLevelRenderer_UpscalingSky",
     "MixinSystemReport",
     "MixinTextureUtil",
     "MixinTheEndGatewayRenderer",

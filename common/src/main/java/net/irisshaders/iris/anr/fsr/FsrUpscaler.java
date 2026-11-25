@@ -53,7 +53,7 @@ public final class FsrUpscaler {
 
 	// Main-target swap state. Static because the pipeline can be replaced in the middle of a frame.
 	@Nullable
-	private static TextureTarget lowResTarget;
+	private static LowResTarget lowResTarget;
 	@Nullable
 	private static RenderTarget swappedOutTarget;
 	private static final Matrix4f unjitteredProjection = new Matrix4f();
@@ -165,6 +165,29 @@ public final class FsrUpscaler {
 		}
 	}
 
+	/** The upscaler of the current shader pipeline, or null. */
+	@Nullable
+	static FsrUpscaler activeUpscaler() {
+		return active;
+	}
+
+	/** Why no frame was upscaled recently, for the F3 screen and the status log. */
+	String idleReason() {
+		if (this.failed) {
+			return "failed, see the log";
+		}
+
+		if (this.motion.hasFailed()) {
+			return "motion vectors failed, see the log";
+		}
+
+		if (!Iris.isPackInUseQuick()) {
+			return "no shader pack in use";
+		}
+
+		return "no world rendered";
+	}
+
 	/** True while the world is being rendered into the low-resolution target. */
 	public static boolean isRenderingLowRes() {
 		return swappedOutTarget != null;
@@ -175,7 +198,30 @@ public final class FsrUpscaler {
 	 * target the world is currently being rendered into.
 	 */
 	public static RenderTarget remapMainTarget(RenderTarget target) {
-		return swappedOutTarget != null && target == swappedOutTarget && lowResTarget != null ? lowResTarget : target;
+		// The sky renderer is (re)created inside renderLevel(), so it can cache either target. Always hand it the target
+		// the world is being rendered into right now; an FSR target it cached may since have been destroyed (shader pack
+		// toggled off, pipeline recreated), which used to crash with a null color texture.
+		if (target instanceof LowResTarget || (swappedOutTarget != null && target == swappedOutTarget)) {
+			RenderTarget current = Minecraft.getInstance().gameRenderer.mainRenderTarget();
+			return current != null && current.getColorTextureView() != null ? current : target;
+		}
+
+		return target;
+	}
+
+	/**
+	 * For renderers created while the world renders (the vanilla sky renderer): the full-resolution main target, never
+	 * the temporary FSR one, so nothing caches a target FSR may destroy later.
+	 */
+	public static RenderTarget unswappedMainTarget(RenderTarget target) {
+		return swappedOutTarget != null && target instanceof LowResTarget ? swappedOutTarget : target;
+	}
+
+	/** The temporary render-resolution main target, typed so it can be recognised wherever it was cached. */
+	private static final class LowResTarget extends TextureTarget {
+		private LowResTarget(int width, int height, GpuFormat colorFormat, GpuFormat depthFormat) {
+			super("Iris FSR render-resolution main", width, height, colorFormat, depthFormat);
+		}
 	}
 
 	/** GameRenderer.render, right before renderLevel(). Does nothing unless an upscaler is active. */
@@ -185,9 +231,24 @@ public final class FsrUpscaler {
 		var upscaler = active;
 		RenderTarget full = gameRenderer.mainRenderTarget();
 
+		if (full instanceof LowResTarget) {
+			// Should never happen (the swap is always undone after renderLevel); never stack swaps.
+			return;
+		}
+
 		if (upscaler == null || upscaler.failed || upscaler.destroyed || upscaler.motion.hasFailed() || swappedOutTarget != null || full.getColorTexture() == null
 			|| full.getDepthTexture() == null || !Iris.isPackInUseQuick()) {
-			syncEntityOutline(full.width, full.height);
+			boolean hadLowRes = lowResTarget != null;
+
+			if (upscaler == null || upscaler.destroyed) {
+				// Upscaling off, shader pack off or pipeline gone: free the render-resolution target.
+				releaseLowResTarget();
+			}
+
+			if (hadLowRes || upscaler != null) {
+				syncEntityOutline(full.width, full.height);
+			}
+
 			return;
 		}
 
@@ -202,7 +263,7 @@ public final class FsrUpscaler {
 			if (lowResTarget == null || lowResTarget.getColorTexture() == null || lowResTarget.getDepthTexture() == null
 				|| lowResTarget.getColorTexture().getFormat() != colorFormat || lowResTarget.getDepthTexture().getFormat() != depthFormat) {
 				releaseLowResTarget();
-				lowResTarget = new TextureTarget("Iris FSR render-resolution main", renderWidth, renderHeight, colorFormat, depthFormat);
+				lowResTarget = new LowResTarget(renderWidth, renderHeight, colorFormat, depthFormat);
 			} else if (lowResTarget.width != renderWidth || lowResTarget.height != renderHeight) {
 				lowResTarget.resize(renderWidth, renderHeight);
 			}
@@ -353,6 +414,7 @@ public final class FsrUpscaler {
 
 			this.lastUpscaledFrame = frame;
 			this.framesSinceReset++;
+			FsrStats.onUpscaledFrame(lowResTarget.width, lowResTarget.height, displayWidth, displayHeight, this.quality.configName());
 
 			if (!this.loggedFirstFrame) {
 				this.loggedFirstFrame = true;
