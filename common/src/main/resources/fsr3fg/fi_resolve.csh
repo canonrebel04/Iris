@@ -117,10 +117,10 @@ struct VectorFieldEntry {
     bool bPosOutside;
 };
 
-void UnpackVectorFieldEntries(uvec2 packed, out VectorFieldEntry vfElement) {
-    vfElement.uHighPriorityFactor = float((packed.x >> PRIORITY_HIGH_OFFSET) & PRIORITY_HIGH_MAX) / float(PRIORITY_HIGH_MAX);
-    vfElement.uLowPriorityFactor = float((packed.x >> PRIORITY_LOW_OFFSET) & PRIORITY_LOW_MAX) / float(PRIORITY_LOW_MAX);
-    vfElement.bPrimary = (packed.x & MOTION_VECTOR_FIELD_PRIMARY_VECTOR_INDICATION_BIT) != 0u;
+void UnpackVectorFieldEntries(uvec2 uPacked, out VectorFieldEntry vfElement) {
+    vfElement.uHighPriorityFactor = float((uPacked.x >> PRIORITY_HIGH_OFFSET) & PRIORITY_HIGH_MAX) / float(PRIORITY_HIGH_MAX);
+    vfElement.uLowPriorityFactor = float((uPacked.x >> PRIORITY_LOW_OFFSET) & PRIORITY_LOW_MAX) / float(PRIORITY_LOW_MAX);
+    vfElement.bPrimary = (uPacked.x & MOTION_VECTOR_FIELD_PRIMARY_VECTOR_INDICATION_BIT) != 0u;
     vfElement.bValid = (vfElement.uHighPriorityFactor > 0.0);
     vfElement.bSecondary = vfElement.bValid && !vfElement.bPrimary;
 
@@ -129,8 +129,8 @@ void UnpackVectorFieldEntries(uvec2 packed, out VectorFieldEntry vfElement) {
         vfElement.uHighPriorityFactor = 1.0 - vfElement.uHighPriorityFactor;
     }
 
-    vfElement.fMotionVector.x = unpackHalf2x16(packed.x).x;
-    vfElement.fMotionVector.y = unpackHalf2x16(packed.y).x;
+    vfElement.fMotionVector.x = unpackHalf2x16(uPacked.x).x;
+    vfElement.fMotionVector.y = unpackHalf2x16(uPacked.y).x;
     vfElement.bInPainted = false;
     vfElement.fVelocity = 0.0;
     vfElement.bNegOutside = false;
