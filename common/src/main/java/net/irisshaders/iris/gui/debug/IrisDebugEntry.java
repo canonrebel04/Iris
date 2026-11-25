@@ -39,6 +39,10 @@ public class IrisDebugEntry implements DebugScreenEntry {
 			debugScreenDisplayer.addToGroup(Identifier.fromNamespaceAndPath("iris", "name"), "[" + Iris.MODNAME + "] Shaders are disabled");
 		}
 
+		for (String line : net.irisshaders.iris.anr.fsr.FsrStats.debugLines()) {
+			debugScreenDisplayer.addToGroup(Identifier.fromNamespaceAndPath("iris", "name"), "[" + Iris.MODNAME + "] " + line);
+		}
+
 		//messages.add(3, "Direct Buffers: +" + iris$humanReadableByteCountBin(iris$directPool.getMemoryUsed()));
 
 	}

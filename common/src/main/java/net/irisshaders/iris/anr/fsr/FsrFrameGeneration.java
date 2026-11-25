@@ -312,6 +312,24 @@ public final class FsrFrameGeneration {
 		}
 	}
 
+	/** Short state for the F3 screen and the status log. */
+	String statusDescription() {
+		if (this.failed) {
+			return "failed (see the log)";
+		}
+
+		if (this.debugView != FsrDebugView.NONE) {
+			return "debug view " + this.debugView.configName() + " (replaces the real frame, nothing extra presented)";
+		}
+
+		if (!this.present) {
+			return "on, not presenting (fsr3FrameGenPresent=false)";
+		}
+
+		return "on (" + (this.vectorField ? "FSR 3 vector field" : "motion-vector search fallback") + ", pacing " + this.pacing.configName()
+			+ ")";
+	}
+
 	/** The generator of the current shader pipeline, or null. */
 	@Nullable
 	public static FsrFrameGeneration active() {
@@ -363,6 +381,7 @@ public final class FsrFrameGeneration {
 			}
 		} finally {
 			FsrFrameState.advanceFrame();
+			FsrStats.onRealFrame();
 		}
 	}
 
@@ -439,6 +458,7 @@ public final class FsrFrameGeneration {
 			surface.blitFromTexture(encoder, this.outputView);
 			RenderSystem.getDevice().createCommandEncoder().submit();
 			surface.present();
+			FsrStats.onGeneratedFramePresented();
 			long generatedPresentNanos = System.nanoTime();
 			this.pace(generatedPresentNanos);
 

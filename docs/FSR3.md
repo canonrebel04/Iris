@@ -156,6 +156,29 @@ Debug views replace the real frame (no generated frames are presented while one 
   inpainting weight.
 - `interpolated`: shows only the generated frames, to judge interpolation quality.
 
+## Is it working? (F3 and the status log)
+
+Vanilla's FPS counter (F3, top left) only counts **real** frames, so frame generation never changes it. Iris adds two
+lines to the Iris group of the F3 screen while either feature is enabled:
+
+```
+[Iris] FSR upscaling 1280x720 -> 1920x1080 (quality)
+[Iris] FSR frame generation on (FSR 3 vector field, pacing vsync): 70 real + 70 generated = 140 presented fps
+```
+
+The same information is logged as `[FSR] Status: ...` about 5 seconds after FSR first does something, then once a
+minute. If a line says `enabled but not running (...)` or `failed (see the log)`, the reason is in brackets.
+
+What to expect:
+
+- **Frame generation** at most doubles the presented frame rate and cannot exceed the refresh rate with vsync on.
+  On a 240 Hz monitor where the game already reaches ~200 FPS, there is nothing to gain (presented stays at 240,
+  real drops to 120). Turn the effect into something visible by capping Max Framerate to e.g. 60: F3 should then read
+  about 60 real + 60 generated = 120 presented, and camera turns look as smooth as 120 FPS.
+- **Upscaling** at `quality` (1.5x) renders 44% of the pixels; at 1080p the difference can be subtle. Try
+  `fsrUpscalingQuality=ultra_performance` (3x): the image becomes visibly softer and FPS should rise if the shader
+  pack is GPU-bound. F3 shows the render resolution either way.
+
 ## Logs (`logs/latest.log`)
 
 - `[FSR3-FG] Enabled on the OpenGL backend (present=true, pacing=vsync, debugView=none, vectorField=true).` on shader
@@ -178,11 +201,19 @@ Debug views replace the real frame (no generated frames are presented while one 
 - `[FSR-SR] The upscale pass did not run this frame ...`: safety net restored the full-resolution target (normal once
   when switching dimension or reloading a pack; anything more is a bug)
 - `[FSR] Motion vector setup failed` / `The motion vector pass failed`: both features off
+- `[FSR] Status: upscaling 1280x720 -> 1920x1080 (quality) | frame generation on (...): 70 real + 70 generated = 140
+  presented fps`: periodic summary
 
 ## What is verified vs not
 
-Verified here (Linux box, no GPU): both jars build; all GLSL passes (fragment and compute) are accepted by Iris's own shader patcher,
-the Vulkan-patched output compiles to SPIR-V with glslang and the unpatched sources compile as GLSL 330; the mixin
+First real-GPU test (Linux, RTX 3060, OpenGL): upscaling and frame generation ran. It found two bugs, both fixed: a
+GLSL reserved word (`packed`) in `fi_resolve.csh` that NVIDIA (and Mesa) reject, and a crash when the shader pack is
+turned off after upscaling ran (the vanilla sky renderer kept FSR's destroyed render-resolution target).
+
+Verified here (Linux box, no GPU): both jars build; every FSR pass is run through Iris's own shader patcher for both
+backends (`tools/fsr-shader-check`); the OpenGL output compiles and links with Mesa's GLSL compiler (llvmpipe, GL 4.5
+core, a strict compiler that reproduces the NVIDIA error above) and with glslang, and the Vulkan output compiles to
+SPIR-V with glslang; the mixin
 targets exist in the 26.3 bytecode (`ldc "swapchainBlit"` + `ProfilerFiller.push` in `Minecraft.renderFrame`,
 `renderLevel()V` in `GameRenderer.render`, `GameRenderer.mainRenderTarget`, `SkyRenderer.renderTarget` reads in
 `SkyRenderer.render`, `LevelRenderer.entityOutlineTarget`).
